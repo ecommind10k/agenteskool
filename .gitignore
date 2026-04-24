@@ -1,0 +1,11 @@
+.env
+venv/
+__pycache__/
+*.pyc
+*.pyo
+output/
+.playwright/
+*.mp3
+*.mp4
+*.wav
+*.log
