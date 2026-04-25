@@ -95,6 +95,7 @@ class LessonSummary:
     content: str  # Full markdown summary
     transcript_length: int
     model_used: str
+    position: int = 0  # lesson index within its module (for filename ordering)
 
 
 class Summarizer:
@@ -114,6 +115,7 @@ class Summarizer:
         module: str,
         course: str,
         transcript: str,
+        position: int = 0,
     ) -> LessonSummary:
         """Generate a structured summary using Claude. Synchronous."""
         if not transcript.strip():
@@ -147,4 +149,5 @@ class Summarizer:
             content=content,
             transcript_length=len(transcript),
             model_used=self.MODEL,
+            position=position,
         )

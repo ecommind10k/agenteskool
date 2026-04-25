@@ -5,6 +5,19 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _load_cursos_txt() -> list[str]:
+    """Read cursos.txt and return the list of course names to process."""
+    path = Path("cursos.txt")
+    if not path.exists():
+        return []
+    names = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            names.append(line)
+    return names
+
+
 class Config:
     SKOOL_EMAIL: str = os.getenv("SKOOL_EMAIL", "")
     SKOOL_PASSWORD: str = os.getenv("SKOOL_PASSWORD", "")
@@ -12,6 +25,7 @@ class Config:
     OUTPUT_DIR: Path = Path(os.getenv("OUTPUT_DIR", "./output"))
     SUMMARY_LANGUAGE: str = os.getenv("SUMMARY_LANGUAGE", "es")
     WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "base")
+    CURSOS_INCLUIR: list[str] = _load_cursos_txt()  # empty = all courses
 
     SKOOL_BASE_URL = "https://www.skool.com"
     SKOOL_LOGIN_URL = "https://www.skool.com/login"

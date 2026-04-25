@@ -158,12 +158,13 @@ class PDFGenerator:
         def clean(s: str) -> str:
             s = re.sub(r'[^\w\s-]', '', s)
             s = re.sub(r'[\s]+', '_', s.strip())
-            return s[:60]
+            return s[:80]
 
-        course = clean(summary.course_name)
-        module = clean(summary.module_name)
+        # File lives inside its module folder already, so just use the title.
+        # Prefix with position so files sort in the correct order.
+        pos = f"{summary.position + 1:02d}" if hasattr(summary, "position") else "01"
         title = clean(summary.lesson_title)
-        return f"{course}__{module}__{title}.pdf"
+        return f"{pos}_{title}.pdf"
 
 
 # ------------------------------------------------------------------ #

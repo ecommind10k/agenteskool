@@ -2,14 +2,14 @@
 """
 Skool Course Summarizer Agent
 ==============================
-Logs into your Skool account, navigates every course you've purchased,
-extracts video transcripts, and generates a detailed PDF summary per lesson.
+Logs into your Skool account, navigates every purchased course,
+extracts video transcripts, and generates a detailed PDF per lesson.
 
 Usage:
-    python main.py                     # full run (all courses)
-    python main.py --course "Name"     # only the course matching "Name"
-    python main.py --visible           # show the browser window (debug)
-    python main.py --lesson-url URL    # summarize a single lesson URL
+    python main.py                  # process courses listed in cursos.txt (all if empty)
+    python main.py --list-courses   # just login and show your course names, then exit
+    python main.py --visible        # show the browser window (useful for debugging)
+    python main.py --lesson-url URL # summarize a single lesson by its Skool URL
 """
 
 import argparse
@@ -26,14 +26,40 @@ from src.pdf_generator import PDFGenerator
 
 def parse_args():
     p = argparse.ArgumentParser(description="Skool Course Summarizer Agent")
-    p.add_argument("--course", metavar="NAME", help="Only process courses matching this name (case-insensitive)")
-    p.add_argument("--visible", action="store_true", help="Show browser window (non-headless mode)")
-    p.add_argument("--lesson-url", metavar="URL", help="Summarize a single lesson by its URL")
+    p.add_argument("--list-courses", action="store_true",
+                   help="Login and list available courses, then exit")
+    p.add_argument("--visible", action="store_true",
+                   help="Show browser window (non-headless mode)")
+    p.add_argument("--lesson-url", metavar="URL",
+                   help="Summarize a single lesson by its URL")
     return p.parse_args()
 
 
+async def list_courses(headless: bool):
+    """Login to Skool and print all enrolled courses."""
+    config.validate()
+    print("\nEntrando a tu cuenta de Skool...\n")
+    async with SkoolClient(config.SKOOL_EMAIL, config.SKOOL_PASSWORD, headless=headless) as client:
+        await client.login()
+        courses = await client.get_my_courses()
+
+    if not courses:
+        print("No se encontraron cursos en tu cuenta.")
+        return
+
+    print("=" * 50)
+    print(f"  Tus cursos en Skool ({len(courses)} encontrados):")
+    print("=" * 50)
+    for i, course in enumerate(courses, 1):
+        print(f"  {i}. {course.name}")
+    print("=" * 50)
+    print("\nCopia los nombres que quieras procesar y")
+    print("pégalos en el archivo cursos.txt (uno por línea).")
+    print("\nPara abrir cursos.txt:  open cursos.txt\n")
+
+
 async def run_single_lesson(url: str, headless: bool):
-    """Quick mode: summarize one lesson given its URL."""
+    """Summarize one lesson given its Skool URL."""
     config.validate()
     extractor = TranscriptExtractor(whisper_model=config.WHISPER_MODEL)
     summarizer = Summarizer(api_key=config.ANTHROPIC_API_KEY, language=config.SUMMARY_LANGUAGE)
@@ -60,48 +86,15 @@ async def run_single_lesson(url: str, headless: bool):
         module=lesson.module_name,
         course=lesson.course_name,
         transcript=transcript,
+        position=lesson.position,
     )
     pdf_path = pdf_gen.generate(summary)
-    print(f"\nPDF generado: {pdf_path}")
+    print(f"\n✅ PDF generado: {pdf_path}\n")
 
 
-async def run_all(args):
+async def run_all(headless: bool):
     orchestrator = Orchestrator(config)
-
-    if args.course:
-        # Filter courses by name after discovery
-        async with SkoolClient(
-            config.SKOOL_EMAIL, config.SKOOL_PASSWORD, headless=not args.visible
-        ) as client:
-            await client.login()
-            all_courses = await client.get_my_courses()
-
-        matching = [c for c in all_courses if args.course.lower() in c.name.lower()]
-        if not matching:
-            print(f"No courses found matching '{args.course}'.")
-            print(f"Available courses: {[c.name for c in all_courses]}")
-            sys.exit(1)
-
-        async with SkoolClient(
-            config.SKOOL_EMAIL, config.SKOOL_PASSWORD, headless=not args.visible
-        ) as client:
-            await client.login()
-            for course in matching:
-                modules = await client.get_course_modules(course)
-                course.modules = modules
-                for module in modules:
-                    for lesson in module.lessons:
-                        await client.get_lesson_details(lesson)
-
-        from src.orchestrator import _safe
-        for course in matching:
-            course_dir = config.OUTPUT_DIR / _safe(course.name)
-            course_dir.mkdir(parents=True, exist_ok=True)
-            for module in course.modules:
-                for lesson in module.lessons:
-                    await orchestrator._process_lesson(lesson, course_dir)
-    else:
-        await orchestrator.run(headless=not args.visible)
+    await orchestrator.run(headless=headless)
 
 
 def main():
@@ -112,15 +105,17 @@ def main():
     print("=" * 60)
 
     try:
-        if args.lesson_url:
+        if args.list_courses:
+            asyncio.run(list_courses(headless=not args.visible))
+        elif args.lesson_url:
             asyncio.run(run_single_lesson(args.lesson_url, headless=not args.visible))
         else:
-            asyncio.run(run_all(args))
+            asyncio.run(run_all(headless=not args.visible))
     except ValueError as e:
-        print(f"\n[Config Error] {e}")
+        print(f"\n❌ Error de configuración: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
-        print("\n[Interrupted] Stopping agent.")
+        print("\n[Interrumpido] Deteniendo el agente.")
         sys.exit(0)
 
 

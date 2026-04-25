@@ -1,0 +1,18 @@
+# ============================================================
+#  cursos.txt — Cursos que quieres procesar
+# ============================================================
+#
+#  Escribe UN curso por línea.
+#  Las líneas que empiezan con # son comentarios (se ignoran).
+#
+#  Si este archivo está VACÍO (borras todo) → procesa TODOS tus cursos.
+#
+#  IMPORTANTE: El nombre debe coincidir (aunque sea parcialmente)
+#  con el nombre que aparece en tu cuenta de Skool.
+#
+#  Ejemplo:
+#    Marketing Digital Avanzado
+#    Copywriting Pro
+#
+# ── Escribe tus cursos aquí abajo ───────────────────────────
+
