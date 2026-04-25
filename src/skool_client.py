@@ -131,14 +131,90 @@ class SkoolClient:
     async def get_my_courses(self) -> List[Course]:
         """
         Busca todas las comunidades/cursos del usuario.
-        Estrategia: ir a la home y buscar slugs válidos en los href.
-        El slug de una comunidad tiene formato /nombre-comunidad (sin subdirectorio).
+        Estrategia principal: hacer clic en el community switcher (↕) del
+        header de Skool — ese dropdown muestra TODAS las comunidades unidas.
+        Fallback: escanear links en la página principal.
         """
-        print("[Skool] Buscando tus cursos en la página principal...")
-        await self._goto("https://www.skool.com/")
-        await asyncio.sleep(4)
+        print("[Skool] Buscando tus cursos...")
 
-        # Extraer todos los links de la página con JavaScript
+        # Estrategia 1: abrir el community switcher (dropdown del header)
+        courses = await self._get_courses_from_switcher()
+
+        # Estrategia 2: escanear la home si el switcher no funcionó
+        if not courses:
+            print("[Skool] Intentando en la página principal...")
+            await self._goto("https://www.skool.com/")
+            await asyncio.sleep(4)
+            courses = await self._extract_community_slugs()
+
+        if not courses:
+            print("[Skool] ⚠️  No se encontraron comunidades.")
+        else:
+            print(f"[Skool] Total: {len(courses)} curso(s) encontrado(s).")
+
+        return courses
+
+    async def _get_courses_from_switcher(self) -> List[Course]:
+        """
+        Hace clic en el botón community switcher (↕ en el header de Skool)
+        para abrir el dropdown y extrae todos los links de comunidad.
+        """
+        print("[Skool] Abriendo community switcher...")
+
+        # Skool usa un botón en el header con el nombre de la comunidad actual
+        # y un ícono de chevron (↕). Lo buscamos y hacemos clic.
+        clicked = await self._page.evaluate("""
+            () => {
+                // Buscar el botón del community switcher en la barra superior
+                // Es un botón con texto + icono SVG en la esquina superior izquierda
+                const allButtons = Array.from(
+                    document.querySelectorAll('button, [role="button"]')
+                );
+                for (const btn of allButtons) {
+                    const r = btn.getBoundingClientRect();
+                    // Debe estar en el área superior izquierda del header
+                    if (r.top < 80 && r.left < 500 && r.width > 40 && r.height > 20) {
+                        const hasText = (btn.innerText || '').trim().length > 0;
+                        const hasSvg = btn.querySelector('svg') !== null;
+                        if (hasText && hasSvg) {
+                            btn.click();
+                            return btn.innerText.trim();
+                        }
+                    }
+                }
+                // Segundo intento: cualquier botón con SVG en el header
+                for (const btn of allButtons) {
+                    const r = btn.getBoundingClientRect();
+                    if (r.top < 80 && btn.querySelector('svg')) {
+                        btn.click();
+                        return 'fallback-click';
+                    }
+                }
+                return null;
+            }
+        """)
+
+        if not clicked:
+            print("[Skool] No se encontró el community switcher.")
+            return []
+
+        print(f"[Skool] Switcher abierto (clic en: {clicked})")
+        await asyncio.sleep(2)  # Esperar animación del dropdown
+
+        # Extraer todos los links del dropdown abierto
+        courses = await self._extract_community_slugs()
+
+        # Cerrar el dropdown presionando Escape
+        await self._page.keyboard.press("Escape")
+        await asyncio.sleep(0.5)
+
+        return courses
+
+    async def _extract_community_slugs(self) -> List[Course]:
+        """
+        Escanea todos los <a href> visibles y filtra los que son slugs
+        de comunidades de Skool (formato: /nombre o /nombre-1234).
+        """
         raw_links = await self._page.evaluate("""
             () => Array.from(document.querySelectorAll('a[href]')).map(a => ({
                 href: a.getAttribute('href') || '',
@@ -146,37 +222,33 @@ class SkoolClient:
             }))
         """)
 
-        # Filtrar links que sean slugs de comunidad
-        # Formato válido: /slug  (solo 1 segmento, sin subdirectorios)
-        seen_slugs = set()
+        seen_slugs: set = set()
         courses: List[Course] = []
+        nav_words = {
+            'classroom', 'members', 'events', 'about', 'feed',
+            'home', 'leaderboards', 'discover', 'search',
+        }
 
         for item in raw_links:
-            href = item.get('href', '').strip()
-            text = item.get('text', '').strip()
+            href = (item.get('href') or '').strip()
+            text = (item.get('text') or '').strip()
 
-            m = re.match(r'^/([a-z0-9][a-z0-9-]{1,60}[a-z0-9])/?$', href)
+            # Slug de comunidad: /algo  o  /algo-1234  (sin subdirectorios)
+            m = re.match(r'^/([a-z0-9][a-z0-9-]{1,70})/?$', href)
             if not m:
                 continue
 
             slug = m.group(1)
             if slug in SYSTEM_SLUGS or slug in seen_slugs:
                 continue
-
-            # Ignorar slugs sin texto descriptivo o con texto de navegación genérico
-            if not text or text.lower() in {'classroom', 'members', 'events', 'about', 'feed', 'home'}:
+            if not text or text.lower() in nav_words or len(text) > 100:
                 continue
 
             seen_slugs.add(slug)
             classroom_url = f"https://www.skool.com/{slug}/classroom"
             courses.append(Course(name=text, url=classroom_url, slug=slug))
-            print(f"  → Comunidad encontrada: {text}  ({slug})")
+            print(f"  → {text}  ({slug})")
 
-        if not courses:
-            print("[Skool] ⚠️  No se encontraron comunidades en la home.")
-            print("         Asegúrate de que el login fue exitoso y tienes cursos activos.")
-
-        print(f"[Skool] Total: {len(courses)} curso(s) encontrado(s).")
         return courses
 
     # ------------------------------------------------------------------ #
