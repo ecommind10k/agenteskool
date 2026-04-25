@@ -13,6 +13,7 @@ Folder structure produced:
 
 import asyncio
 from pathlib import Path
+from typing import Optional
 
 from .config import Config
 from .skool_client import SkoolClient, Course, Lesson
@@ -75,7 +76,7 @@ class Orchestrator:
         print(f"{'='*60}\n")
         return self._generated
 
-    async def _process_lesson(self, lesson: Lesson, module_dir: Path) -> Path | None:
+    async def _process_lesson(self, lesson: Lesson, module_dir: Path) -> Optional[Path]:
         try:
             print(f"\n    → [{lesson.position + 1}] {lesson.title}")
 
