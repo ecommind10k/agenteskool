@@ -1,13 +1,28 @@
 """
-Skool browser automation client.
-Handles login, course discovery, and lesson navigation using Playwright.
+Skool browser automation client - v3
+Estrategia:
+  - Descubrir comunidades buscando slugs válidos en la home (/slug sin subdirectorio)
+  - Extraer módulos y lecciones con JavaScript para leer el DOM completo
+  - Expandir módulos colapsados antes de extraer lecciones
 """
 
 import asyncio
 import re
 from dataclasses import dataclass, field
 from typing import Optional, List
-from playwright.async_api import async_playwright, Page, BrowserContext
+from playwright.async_api import async_playwright, BrowserContext
+
+# Rutas del sistema de Skool que NO son comunidades
+SYSTEM_SLUGS = {
+    'login', 'signup', 'profile', 'discover', 'notifications',
+    'settings', 'help', 'terms', 'privacy', 'pricing', 'about',
+    'careers', 'affiliate', 'new', 'search', 'blog', 'classroom',
+    'feed', 'members', 'events', 'leaderboard', 'courses', 'home',
+    'dashboard', 'admin', 'api', 'static', 'assets', 'community',
+    'groups', 'account', 'billing', 'contact', 'g',
+}
+
+NAV_TIMEOUT = 60_000
 
 
 @dataclass
@@ -32,11 +47,8 @@ class Module:
 class Course:
     name: str
     url: str
+    slug: str = ""
     modules: List[Module] = field(default_factory=list)
-
-
-# Timeout usado en todas las navegaciones (ms)
-NAV_TIMEOUT = 60_000
 
 
 class SkoolClient:
@@ -47,7 +59,7 @@ class SkoolClient:
         self._playwright = None
         self._browser = None
         self._context: Optional[BrowserContext] = None
-        self._page: Optional[Page] = None
+        self._page = None
 
     async def __aenter__(self):
         await self.start()
@@ -79,6 +91,9 @@ class SkoolClient:
         if self._playwright:
             await self._playwright.stop()
 
+    async def _goto(self, url: str):
+        await self._page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+
     # ------------------------------------------------------------------ #
     # Login                                                                #
     # ------------------------------------------------------------------ #
@@ -86,11 +101,12 @@ class SkoolClient:
     async def login(self) -> bool:
         print("[Skool] Abriendo página de login...")
         await self._goto("https://www.skool.com/login")
+        await asyncio.sleep(1)
 
         await self._page.fill('input[type="email"]', self.email)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.4)
         await self._page.fill('input[type="password"]', self.password)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.4)
         await self._page.click('button[type="submit"]')
 
         try:
@@ -98,222 +114,267 @@ class SkoolClient:
                 lambda url: "skool.com" in url and "login" not in url,
                 timeout=20000,
             )
+            await asyncio.sleep(3)
             print("[Skool] Login exitoso.")
-            await asyncio.sleep(2)
             return True
         except Exception:
             content = await self._page.content()
             if "incorrect" in content.lower() or "invalid" in content.lower():
-                raise ValueError(
-                    "Credenciales incorrectas. Revisa tu email y contraseña de Skool."
-                )
-            print("[Skool] Login aparentemente exitoso, continuando...")
+                raise ValueError("Credenciales incorrectas. Revisa tu email y contraseña.")
+            print("[Skool] Login completado.")
             return True
 
     # ------------------------------------------------------------------ #
-    # Course discovery                                                     #
+    # Descubrir cursos                                                     #
     # ------------------------------------------------------------------ #
 
     async def get_my_courses(self) -> List[Course]:
-        """Busca todos los cursos/comunidades del usuario."""
-        print("[Skool] Buscando tus cursos...")
+        """
+        Busca todas las comunidades/cursos del usuario.
+        Estrategia: ir a la home y buscar slugs válidos en los href.
+        El slug de una comunidad tiene formato /nombre-comunidad (sin subdirectorio).
+        """
+        print("[Skool] Buscando tus cursos en la página principal...")
+        await self._goto("https://www.skool.com/")
+        await asyncio.sleep(4)
 
+        # Extraer todos los links de la página con JavaScript
+        raw_links = await self._page.evaluate("""
+            () => Array.from(document.querySelectorAll('a[href]')).map(a => ({
+                href: a.getAttribute('href') || '',
+                text: (a.innerText || a.textContent || '').trim().split('\\n')[0].trim()
+            }))
+        """)
+
+        # Filtrar links que sean slugs de comunidad
+        # Formato válido: /slug  (solo 1 segmento, sin subdirectorios)
+        seen_slugs = set()
         courses: List[Course] = []
 
-        # Intento 1: página principal post-login (sidebar con comunidades)
-        courses = await self._scrape_courses_from_page("https://www.skool.com/")
-        if courses:
-            print(f"[Skool] {len(courses)} curso(s) encontrados.")
-            return courses
+        for item in raw_links:
+            href = item.get('href', '').strip()
+            text = item.get('text', '').strip()
 
-        # Intento 2: página de perfil
-        courses = await self._scrape_courses_from_page("https://www.skool.com/profile")
-        if courses:
-            print(f"[Skool] {len(courses)} curso(s) encontrados.")
-            return courses
-
-        # Intento 3: buscar cualquier enlace /*/classroom en la página actual
-        courses = await self._extract_classroom_links()
-        if courses:
-            print(f"[Skool] {len(courses)} curso(s) encontrados.")
-            return courses
-
-        print("[Skool] No se encontraron cursos automáticamente.")
-        return courses
-
-    async def _scrape_courses_from_page(self, url: str) -> List[Course]:
-        """Navega a una URL y extrae links de classroom."""
-        try:
-            await self._goto(url)
-            await asyncio.sleep(3)
-            return await self._extract_classroom_links()
-        except Exception as e:
-            print(f"[Skool] Error al cargar {url}: {e}")
-            return []
-
-    async def _extract_classroom_links(self) -> List[Course]:
-        """Extrae todos los links /*/classroom de la página actual."""
-        courses: List[Course] = []
-        seen: set = set()
-
-        links = await self._page.query_selector_all("a[href*='/classroom']")
-        for link in links:
-            href = await link.get_attribute("href")
-            if not href or href in seen:
+            m = re.match(r'^/([a-z0-9][a-z0-9-]{1,60}[a-z0-9])/?$', href)
+            if not m:
                 continue
-            if href.rstrip("/").endswith("/classroom") is False and "/classroom/" not in href:
+
+            slug = m.group(1)
+            if slug in SYSTEM_SLUGS or slug in seen_slugs:
                 continue
-            # Normalizar: quedarse con la URL base del classroom
-            base = re.sub(r'/classroom/.*', '/classroom', href)
-            if base in seen:
+
+            # Ignorar slugs sin texto descriptivo o con texto de navegación genérico
+            if not text or text.lower() in {'classroom', 'members', 'events', 'about', 'feed', 'home'}:
                 continue
-            seen.add(base)
 
-            text = (await link.inner_text()).strip()
-            full_url = base if base.startswith("http") else f"https://www.skool.com{base}"
+            seen_slugs.add(slug)
+            classroom_url = f"https://www.skool.com/{slug}/classroom"
+            courses.append(Course(name=text, url=classroom_url, slug=slug))
+            print(f"  → Comunidad encontrada: {text}  ({slug})")
 
-            # Extraer nombre del slug si no hay texto
-            if not text or len(text) < 2:
-                slug = base.strip("/").split("/")[-2] if "/classroom" in base else base.strip("/").split("/")[-1]
-                text = slug.replace("-", " ").title()
+        if not courses:
+            print("[Skool] ⚠️  No se encontraron comunidades en la home.")
+            print("         Asegúrate de que el login fue exitoso y tienes cursos activos.")
 
-            courses.append(Course(name=text, url=full_url))
-
+        print(f"[Skool] Total: {len(courses)} curso(s) encontrado(s).")
         return courses
 
     # ------------------------------------------------------------------ #
-    # Module & lesson discovery                                            #
+    # Módulos y lecciones                                                  #
     # ------------------------------------------------------------------ #
 
     async def get_course_modules(self, course: Course) -> List[Module]:
-        """Navega al classroom y mapea módulos y lecciones."""
         print(f"\n[Skool] Cargando classroom: {course.name}")
+        print(f"  URL: {course.url}")
         await self._goto(course.url)
         await asyncio.sleep(4)
 
-        # Intentar hacer scroll para que cargue contenido lazy
-        await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await asyncio.sleep(2)
+        # Expandir todos los módulos colapsados (Skool los colapsa por defecto)
+        await self._expand_all_modules()
 
-        # Extraer estructura de módulos y lecciones del sidebar
-        modules = await self._extract_modules(course)
+        # Extraer módulos y lecciones
+        modules = await self._extract_modules_and_lessons(course)
 
-        if not modules:
-            print(f"  ⚠️  No se encontraron lecciones en {course.name}")
-        else:
+        if modules:
             total = sum(len(m.lessons) for m in modules)
-            print(f"  → {total} lección(es) en {len(modules)} módulo(s)")
+            print(f"  ✅ {total} lección(es) en {len(modules)} módulo(s)")
+        else:
+            print(f"  ⚠️  No se encontraron lecciones en este classroom")
 
         return modules
 
-    async def _extract_modules(self, course: Course) -> List[Module]:
+    async def _expand_all_modules(self):
         """
-        Extrae módulos y lecciones del sidebar del classroom de Skool.
-        Skool renderiza el sidebar con secciones colapsables.
+        Skool muestra los módulos colapsados. Hay que hacer click en cada
+        header de módulo para ver las lecciones dentro.
         """
-        modules: List[Module] = []
-        current_module: Optional[Module] = None
-        position = 0
-        seen_hrefs: set = set()
+        print("  [→] Expandiendo módulos...")
 
-        # Obtener todos los elementos del sidebar en orden DOM
-        # Skool usa divs con clases como 'styled__UnitContainer', 'styled__LessonRow', etc.
-        # Intentamos con múltiples selectores para cubrir diferentes versiones del UI
-        all_items = await self._page.query_selector_all(
-            "[class*='Unit'], [class*='unit'], [class*='Section'], [class*='section'], "
-            "[class*='Module'], [class*='module'], "
-            "a[href*='/classroom/']"
-        )
+        # Intentar con varios selectores comunes de elementos colapsables
+        expand_js = """
+            () => {
+                // Buscar botones/elementos con aria-expanded=false
+                const collapsed = document.querySelectorAll(
+                    '[aria-expanded="false"], [data-expanded="false"]'
+                );
+                collapsed.forEach(el => {
+                    try { el.click(); } catch(e) {}
+                });
 
-        for item in all_items:
-            tag = await item.evaluate("el => el.tagName.toLowerCase()")
-            href = await item.get_attribute("href") if tag == "a" else None
+                // También buscar headers de sección que parezcan clicables
+                const headers = document.querySelectorAll(
+                    '[class*="Section"] > [class*="Header"], ' +
+                    '[class*="Module"] > [class*="Title"], ' +
+                    '[class*="Unit"] > [class*="Header"], ' +
+                    '[class*="section-header"], [class*="module-header"]'
+                );
+                headers.forEach(el => {
+                    try { el.click(); } catch(e) {}
+                });
 
-            if href and "/classroom/" in href:
-                # Es un link de lección
-                if href in seen_hrefs:
-                    continue
-                seen_hrefs.add(href)
+                return collapsed.length + headers.length;
+            }
+        """
 
-                text = (await item.inner_text()).strip()
-                if not text:
-                    continue
+        clicked = await self._page.evaluate(expand_js)
+        if clicked:
+            print(f"  [→] {clicked} elemento(s) expandido(s)")
+            await asyncio.sleep(2)
 
-                full_url = href if href.startswith("http") else f"https://www.skool.com{href}"
+        # Segundo intento: hacer scroll para activar lazy-loading y volver a expandir
+        await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+        await asyncio.sleep(1)
+        await self._page.evaluate("window.scrollTo(0, 0)")
+        await asyncio.sleep(1)
 
-                if current_module is None:
-                    current_module = Module(name="Módulo 1")
-                    modules.append(current_module)
+        # Tercer intento con Playwright directo
+        for selector in ["button[aria-expanded='false']", "[role='button'][aria-expanded='false']"]:
+            buttons = await self._page.query_selector_all(selector)
+            for btn in buttons:
+                try:
+                    await btn.click()
+                    await asyncio.sleep(0.2)
+                except Exception:
+                    pass
 
-                lesson = Lesson(
-                    title=text,
-                    url=full_url,
-                    module_name=current_module.name,
-                    course_name=course.name,
-                    position=position,
-                )
-                current_module.lessons.append(lesson)
-                position += 1
-            else:
-                # Puede ser un header de módulo/sección
-                text = (await item.inner_text()).strip().split("\n")[0]
-                if text and len(text) > 1 and len(text) < 120:
-                    # Crear nuevo módulo solo si parece un título
-                    new_mod = Module(name=text)
-                    modules.append(new_mod)
-                    current_module = new_mod
+        await asyncio.sleep(1)
 
-        # Eliminar módulos vacíos
-        modules = [m for m in modules if m.lessons]
+    async def _extract_modules_and_lessons(self, course: Course) -> List[Module]:
+        """
+        Extrae todas las lecciones del sidebar del classroom.
+        Las lecciones tienen URLs del tipo: /<slug>/classroom/<lesson-id>
+        Intenta agruparlas por módulo buscando elementos hermanos en el DOM.
+        """
+        slug = course.slug
 
-        # Si no encontramos nada con el método anterior, buscar solo links
-        if not modules:
-            modules = await self._extract_lessons_fallback(course)
+        # Extraer todos los links de lección con su contexto de módulo
+        lesson_data = await self._page.evaluate(f"""
+            () => {{
+                const SLUG = '{slug}';
+                const lessonPattern = new RegExp('^/' + SLUG + '/classroom/[^/]+');
+                const results = [];
+                const seen = new Set();
 
-        # Renumerar posiciones por módulo
-        for module in modules:
-            for i, lesson in enumerate(module.lessons):
-                lesson.position = i
+                document.querySelectorAll('a[href]').forEach(a => {{
+                    const href = a.getAttribute('href') || '';
+                    if (!lessonPattern.test(href) || seen.has(href)) return;
+                    seen.add(href);
 
-        return modules
+                    const text = (a.innerText || a.textContent || '').trim();
+                    if (!text) return;
 
-    async def _extract_lessons_fallback(self, course: Course) -> List[Module]:
-        """Fallback simple: un módulo con todos los links de classroom."""
-        links = await self._page.query_selector_all("a[href*='/classroom/']")
+                    // Subir por el DOM para encontrar el nombre del módulo padre
+                    let moduleName = 'Módulo 1';
+                    let el = a.parentElement;
+                    for (let depth = 0; depth < 10; depth++) {{
+                        if (!el) break;
+                        // Buscar elementos hermanos anteriores que sean headers
+                        let sibling = el.previousElementSibling;
+                        while (sibling) {{
+                            const t = (sibling.innerText || sibling.textContent || '')
+                                        .trim().split('\\n')[0].trim();
+                            if (t && t.length > 1 && t.length < 120 &&
+                                !t.match(/^\\d+$/) ) {{
+                                moduleName = t;
+                                break;
+                            }}
+                            sibling = sibling.previousElementSibling;
+                        }}
+                        if (moduleName !== 'Módulo 1') break;
+                        el = el.parentElement;
+                    }}
+
+                    results.push({{ href, text, moduleName }});
+                }});
+
+                return results;
+            }}
+        """)
+
+        if not lesson_data:
+            print("  ⚠️  No se encontraron links de lección. Intentando método alternativo...")
+            return await self._extract_lessons_simple(course)
+
+        # Construir módulos manteniendo el orden de aparición
+        modules_ordered: List[str] = []
+        modules_dict = {}
+
+        for item in lesson_data:
+            mod_name = item.get('moduleName', 'Módulo 1')
+            if mod_name not in modules_dict:
+                modules_ordered.append(mod_name)
+                modules_dict[mod_name] = Module(name=mod_name)
+
+        position_in_module = {name: 0 for name in modules_dict}
+
+        for item in lesson_data:
+            href = item.get('href', '')
+            text = item.get('text', '').strip()
+            mod_name = item.get('moduleName', 'Módulo 1')
+
+            full_url = f"https://www.skool.com{href}"
+            pos = position_in_module[mod_name]
+            position_in_module[mod_name] += 1
+
+            lesson = Lesson(
+                title=text,
+                url=full_url,
+                module_name=mod_name,
+                course_name=course.name,
+                position=pos,
+            )
+            modules_dict[mod_name].lessons.append(lesson)
+
+        return [modules_dict[n] for n in modules_ordered]
+
+    async def _extract_lessons_simple(self, course: Course) -> List[Module]:
+        """Fallback: un solo módulo con todos los links de lección encontrados."""
+        slug = course.slug
+        links = await self._page.query_selector_all(f"a[href*='/{slug}/classroom/']")
         module = Module(name="Contenido del Curso")
         seen: set = set()
-        position = 0
 
-        for link in links:
-            href = await link.get_attribute("href")
-            if not href or href in seen:
-                continue
-            if href.rstrip("/").endswith("/classroom"):
+        for i, link in enumerate(links):
+            href = await link.get_attribute("href") or ""
+            if href in seen:
                 continue
             seen.add(href)
-
             text = (await link.inner_text()).strip()
             if not text:
                 continue
-
             full_url = href if href.startswith("http") else f"https://www.skool.com{href}"
             module.lessons.append(Lesson(
-                title=text,
-                url=full_url,
-                module_name=module.name,
-                course_name=course.name,
-                position=position,
+                title=text, url=full_url,
+                module_name=module.name, course_name=course.name, position=i,
             ))
-            position += 1
 
         return [module] if module.lessons else []
 
     # ------------------------------------------------------------------ #
-    # Lesson details                                                       #
+    # Detalle de lección (video ID + descripción)                         #
     # ------------------------------------------------------------------ #
 
     async def get_lesson_details(self, lesson: Lesson) -> Lesson:
-        """Visita una lección y extrae el ID de video y descripción."""
         print(f"    [video] {lesson.title}")
         await self._goto(lesson.url)
         await asyncio.sleep(3)
@@ -323,48 +384,36 @@ class SkoolClient:
         if wistia_id:
             lesson.wistia_id = wistia_id
         else:
-            video_src = await self._find_video_src()
-            if video_src:
-                lesson.video_url = video_src
+            src = await self._find_video_src()
+            if src:
+                lesson.video_url = src
 
         lesson.description = await self._extract_lesson_text()
         return lesson
 
     def _extract_wistia_id(self, html: str) -> Optional[str]:
-        patterns = [
+        for pat in [
             r'wistia\.com/medias/([a-z0-9]+)',
             r'wistia_async_([a-z0-9]+)',
             r'"hashed_id"\s*:\s*"([a-z0-9]+)"',
             r'hashedId["\s:]+([a-z0-9]{10,})',
-            r'W\.iApi\s*\(\s*["\']([a-z0-9]+)["\']',
-        ]
-        for pat in patterns:
+        ]:
             m = re.search(pat, html, re.IGNORECASE)
             if m:
                 return m.group(1)
         return None
 
     async def _find_video_src(self) -> Optional[str]:
-        video_el = await self._page.query_selector("video source, video[src]")
-        if video_el:
-            return await video_el.get_attribute("src")
-        iframe = await self._page.query_selector(
-            "iframe[src*='wistia'], iframe[src*='vimeo'], iframe[src*='youtube']"
-        )
-        if iframe:
-            return await iframe.get_attribute("src")
+        for sel in ["video source", "video[src]",
+                    "iframe[src*='wistia']", "iframe[src*='vimeo']", "iframe[src*='youtube']"]:
+            el = await self._page.query_selector(sel)
+            if el:
+                return await el.get_attribute("src")
         return None
 
     async def _extract_lesson_text(self) -> str:
-        selectors = [
-            "[class*='lesson-content']",
-            "[class*='LessonContent']",
-            "[class*='description']",
-            "[class*='content-body']",
-            "article",
-            "main",
-        ]
-        for sel in selectors:
+        for sel in ["[class*='LessonContent']", "[class*='lesson-content']",
+                    "[class*='description']", "article", "main"]:
             el = await self._page.query_selector(sel)
             if el:
                 text = await el.inner_text()
@@ -373,27 +422,16 @@ class SkoolClient:
         return ""
 
     # ------------------------------------------------------------------ #
-    # Full pipeline                                                        #
+    # Pipeline completo                                                    #
     # ------------------------------------------------------------------ #
 
     async def scrape_all(self) -> List[Course]:
-        """Login → descubrir cursos → mapear módulos y lecciones."""
         await self.login()
         courses = await self.get_my_courses()
-
         for course in courses:
             modules = await self.get_course_modules(course)
             course.modules = modules
             for module in modules:
                 for lesson in module.lessons:
                     await self.get_lesson_details(lesson)
-
         return courses
-
-    # ------------------------------------------------------------------ #
-    # Helper                                                               #
-    # ------------------------------------------------------------------ #
-
-    async def _goto(self, url: str):
-        """Navega a una URL usando domcontentloaded (mucho más rápido que networkidle)."""
-        await self._page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
