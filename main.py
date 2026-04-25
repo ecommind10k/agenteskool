@@ -55,7 +55,8 @@ async def list_courses(headless: bool):
     print("=" * 50)
     print("\nCopia los nombres que quieras procesar y")
     print("pégalos en el archivo cursos.txt (uno por línea).")
-    print("\nPara abrir cursos.txt:  open cursos.txt\n")
+    print("\nPara editar cursos.txt:  open -e cursos.txt")
+    print("Si no funciona:          nano cursos.txt\n")
 
 
 async def run_single_lesson(url: str, headless: bool):

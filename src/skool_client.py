@@ -156,55 +156,70 @@ class SkoolClient:
 
     async def _get_courses_from_switcher(self) -> List[Course]:
         """
-        Hace clic en el botón community switcher (↕ en el header de Skool)
-        para abrir el dropdown y extrae todos los links de comunidad.
+        Usa Playwright (no JS) para hacer clic en el community switcher,
+        espera a que el dropdown aparezca, y extrae los links de comunidad.
         """
-        print("[Skool] Abriendo community switcher...")
+        print("[Skool] Buscando el community switcher...")
 
-        # Skool usa un botón en el header con el nombre de la comunidad actual
-        # y un ícono de chevron (↕). Lo buscamos y hacemos clic.
-        clicked = await self._page.evaluate("""
-            () => {
-                // Buscar el botón del community switcher en la barra superior
-                // Es un botón con texto + icono SVG en la esquina superior izquierda
-                const allButtons = Array.from(
-                    document.querySelectorAll('button, [role="button"]')
-                );
-                for (const btn of allButtons) {
-                    const r = btn.getBoundingClientRect();
-                    // Debe estar en el área superior izquierda del header
-                    if (r.top < 80 && r.left < 500 && r.width > 40 && r.height > 20) {
-                        const hasText = (btn.innerText || '').trim().length > 0;
-                        const hasSvg = btn.querySelector('svg') !== null;
-                        if (hasText && hasSvg) {
-                            btn.click();
-                            return btn.innerText.trim();
-                        }
-                    }
-                }
-                // Segundo intento: cualquier botón con SVG en el header
-                for (const btn of allButtons) {
-                    const r = btn.getBoundingClientRect();
-                    if (r.top < 80 && btn.querySelector('svg')) {
-                        btn.click();
-                        return 'fallback-click';
-                    }
-                }
-                return null;
-            }
-        """)
+        # Contar los links actuales antes de abrir el dropdown
+        links_before = await self._page.evaluate(
+            "() => document.querySelectorAll('a[href]').length"
+        )
 
-        if not clicked:
-            print("[Skool] No se encontró el community switcher.")
+        # Buscar el botón del switcher usando bounding_box (posición real en pantalla)
+        # El switcher está en la esquina superior izquierda, tiene texto + SVG
+        switcher_btn = None
+        all_buttons = await self._page.query_selector_all("button")
+        for btn in all_buttons:
+            try:
+                box = await btn.bounding_box()
+                if not box:
+                    continue
+                # Debe estar en la franja superior (y < 80px) e izquierda (x < 500px)
+                if box['y'] < 80 and box['x'] < 500 and box['width'] > 30:
+                    text = (await btn.inner_text()).strip()
+                    has_svg = await btn.query_selector("svg") is not None
+                    if text and has_svg and len(text) > 1:
+                        switcher_btn = btn
+                        print(f"  [→] Switcher encontrado: '{text[:40]}'")
+                        break
+            except Exception:
+                continue
+
+        if not switcher_btn:
+            # Segundo intento: cualquier botón con SVG en el header
+            for btn in all_buttons:
+                try:
+                    box = await btn.bounding_box()
+                    if box and box['y'] < 80 and await btn.query_selector("svg"):
+                        switcher_btn = btn
+                        print("  [→] Switcher encontrado (fallback)")
+                        break
+                except Exception:
+                    continue
+
+        if not switcher_btn:
+            print("  ⚠️  No se encontró el community switcher")
             return []
 
-        print(f"[Skool] Switcher abierto (clic en: {clicked})")
-        await asyncio.sleep(2)  # Esperar animación del dropdown
+        # Clic con Playwright (no JS) — esto mantiene el foco correctamente
+        await switcher_btn.click()
+        print("  [→] Clic en switcher. Esperando dropdown...")
 
-        # Extraer todos los links del dropdown abierto
+        # Esperar a que aparezcan nuevos links (el dropdown se renderiza)
+        try:
+            await self._page.wait_for_function(
+                f"() => document.querySelectorAll('a[href]').length > {links_before + 2}",
+                timeout=6000,
+            )
+            print("  [→] Dropdown visible")
+        except Exception:
+            await asyncio.sleep(2.5)
+
+        # Extraer links AHORA (mientras el dropdown está abierto)
         courses = await self._extract_community_slugs()
 
-        # Cerrar el dropdown presionando Escape
+        # Cerrar el dropdown
         await self._page.keyboard.press("Escape")
         await asyncio.sleep(0.5)
 
@@ -261,7 +276,21 @@ class SkoolClient:
         await self._goto(course.url)
         await asyncio.sleep(4)
 
-        # Expandir todos los módulos colapsados (Skool los colapsa por defecto)
+        # Imprimir URL final (por si redirigió)
+        print(f"  URL actual: {self._page.url}")
+
+        # Debug: mostrar todos los links del classroom para entender la estructura
+        all_links = await self._page.evaluate("""
+            () => Array.from(document.querySelectorAll('a[href]'))
+                .map(a => ({ href: a.getAttribute('href'), text: (a.innerText||'').trim().slice(0,60) }))
+                .filter(x => x.href && !x.href.startsWith('http'))
+                .slice(0, 40)
+        """)
+        print(f"  [Debug] {len(all_links)} links internos en la página:")
+        for lnk in all_links[:20]:
+            print(f"    {lnk['href']}  →  {lnk['text']}")
+
+        # Expandir todos los módulos colapsados
         await self._expand_all_modules()
 
         # Extraer módulos y lecciones
@@ -271,7 +300,7 @@ class SkoolClient:
             total = sum(len(m.lessons) for m in modules)
             print(f"  ✅ {total} lección(es) en {len(modules)} módulo(s)")
         else:
-            print(f"  ⚠️  No se encontraron lecciones en este classroom")
+            print(f"  ⚠️  No se encontraron lecciones — revisa el debug arriba")
 
         return modules
 
