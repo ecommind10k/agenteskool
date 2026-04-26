@@ -565,13 +565,16 @@ class SkoolClient:
         await asyncio.sleep(4)
         print(f"  URL actual: {self._page.url}")
 
+        # Hacer scroll para cargar todas las tarjetas (lazy loading)
+        await self._scroll_page()
+
         module_links = await self._find_module_card_links(course)
         print(f"  Módulos encontrados: {len(module_links)}")
         for mod_url, mod_name in module_links:
             print(f"    → {mod_name}  ({mod_url})")
 
         if not module_links:
-            print("  ⚠️  Sin tarjetas de módulo. Buscando lecciones directamente...")
+            print("  ⚠️  Sin módulos. Buscando lecciones directamente...")
             return await self._extract_lessons_as_single_module(course)
 
         modules: List[Module] = []
@@ -590,58 +593,196 @@ class SkoolClient:
         print(f"\n  ✅ Total: {total} lección(es) en {len(modules)} módulo(s)")
         return modules
 
+    async def _scroll_page(self):
+        """Hace scroll hacia abajo para forzar la carga de contenido lazy."""
+        await self._page.evaluate("""
+            async () => {
+                let lastH = 0;
+                for (let i = 0; i < 8; i++) {
+                    window.scrollBy(0, window.innerHeight);
+                    await new Promise(r => setTimeout(r, 400));
+                    if (document.body.scrollHeight === lastH) break;
+                    lastH = document.body.scrollHeight;
+                }
+                window.scrollTo(0, 0);
+            }
+        """)
+        await asyncio.sleep(1)
+
     async def _find_module_card_links(self, course: Course) -> List[Tuple[str, str]]:
+        """
+        Busca tarjetas de módulo en el classroom.
+        Estrategia 1: links <a> cuya href incluya /slug/classroom/ más algo.
+        Estrategia 2: click-and-record en divs con cursor:pointer y título.
+        """
         slug = course.slug
+        classroom_url = self._page.url
+
+        # ── Debug: imprimir todos los links de la página ──────────────────
+        all_links = await self._page.evaluate("""
+            () => Array.from(document.querySelectorAll('a[href]'))
+                .map(a => ({
+                    rel: a.getAttribute('href') || '',
+                    abs: a.href || '',
+                    text: (a.innerText || '').trim().split('\\n')[0].slice(0, 50)
+                }))
+                .filter(l => l.rel)
+                .slice(0, 40)
+        """)
+        print(f"  [Debug] Links en la página ({len(all_links)} totales, mostrando ≤40):")
+        for l in all_links:
+            print(f"    {l['rel']!r:55s} → {l['text']!r}")
+
+        # ── Estrategia 1: buscar <a> con URL de módulo ────────────────────
         links = await self._page.evaluate(f"""
             () => {{
                 const slug = {repr(slug)};
-                const pattern = new RegExp(
-                    '^\\\\/' + slug + '\\\\/classroom\\\\/[^/]+\\\\/?$'
-                );
+                const base = '/' + slug + '/classroom/';
                 const results = [];
                 const seen = new Set();
                 document.querySelectorAll('a[href]').forEach(a => {{
-                    const href = a.getAttribute('href') || '';
-                    if (pattern.test(href) && !seen.has(href)) {{
-                        seen.add(href);
-                        let text = '';
-                        const h = a.querySelector('h1,h2,h3,h4,h5,p,span');
-                        if (h) text = h.innerText.trim().split('\\n')[0];
-                        if (!text) text = a.innerText.trim().split('\\n')[0];
-                        if (text) results.push({{href, text}});
-                    }}
+                    // Usar la URL absoluta (a.href) — más fiable que getAttribute
+                    const abs = a.href || '';
+                    const rel = a.getAttribute('href') || '';
+                    const useHref = abs.includes('/classroom/') ? abs : rel;
+                    if ((!useHref.includes('/classroom/') && !rel.startsWith(base))
+                            || seen.has(abs || rel)) return;
+                    seen.add(abs || rel);
+                    let text = '';
+                    const h = a.querySelector('h1,h2,h3,h4,h5,p,span');
+                    if (h) text = h.innerText.trim().split('\\n')[0];
+                    if (!text) text = a.innerText.trim().split('\\n')[0];
+                    if (text && !useHref.endsWith('/classroom')
+                             && !useHref.endsWith('/classroom/'))
+                        results.push({{href: abs || ('https://www.skool.com' + rel), text}});
                 }});
                 return results;
             }}
         """)
-        return [
-            (f"https://www.skool.com{l['href']}", l['text'])
-            for l in links if l.get('text')
-        ]
+
+        if links:
+            print(f"  ✅ {len(links)} módulo(s) via <a href>")
+            return [(l['href'], l['text']) for l in links if l.get('text')]
+
+        # ── Estrategia 2: click-and-record en tarjetas ────────────────────
+        print("  Sin <a href> de módulo. Usando click-and-record en tarjetas...")
+        return await self._click_record_module_cards(course, classroom_url)
+
+    async def _click_record_module_cards(
+        self, course: Course, classroom_url: str
+    ) -> List[Tuple[str, str]]:
+        """
+        Hace clic en cada tarjeta visible (div con cursor:pointer y un título)
+        y registra la URL a la que navega Skool. Así encontramos módulos
+        aunque sean divs de React sin href.
+        """
+        # Buscar elementos clicables con un h1-h5 adentro
+        cards = await self._page.evaluate("""
+            () => {
+                const results = [];
+                const seen = new Set();
+                document.querySelectorAll('h1,h2,h3,h4,h5').forEach(h => {
+                    const text = h.innerText.trim().split('\\n')[0].slice(0, 80);
+                    if (!text || text.length < 2 || seen.has(text)) return;
+                    let el = h.parentElement;
+                    for (let d = 0; d < 7; d++) {
+                        if (!el || el === document.body) break;
+                        const s = window.getComputedStyle(el);
+                        const r = el.getBoundingClientRect();
+                        if (s.cursor === 'pointer' && r.width > 80 && r.height > 60) {
+                            seen.add(text);
+                            results.push({
+                                text,
+                                cx: Math.round(r.x + r.width / 2),
+                                cy: Math.round(r.y + r.height / 2),
+                                tag: el.tagName.toLowerCase(),
+                            });
+                            break;
+                        }
+                        el = el.parentElement;
+                    }
+                });
+                return results;
+            }
+        """)
+
+        print(f"  [Click-record] {len(cards)} tarjeta(s) con cursor:pointer:")
+        for c in cards[:10]:
+            print(f"    [{c['tag']}] {c['text']!r} @ ({c['cx']}, {c['cy']})")
+
+        if not cards:
+            return []
+
+        module_links: List[Tuple[str, str]] = []
+        seen_urls: set = set()
+
+        for card in cards:
+            # Hacer scroll al card y clic
+            await self._page.evaluate(
+                f"() => {{ const e = document.elementFromPoint({card['cx']}, {card['cy']});"
+                f" if(e) e.scrollIntoView({{block:'center'}}); }}"
+            )
+            await asyncio.sleep(0.4)
+
+            url_before = self._page.url
+            await self._page.mouse.click(card['cx'], card['cy'])
+
+            try:
+                await self._page.wait_for_function(
+                    f"() => window.location.href !== {repr(url_before)}",
+                    timeout=5000,
+                )
+            except Exception:
+                pass
+
+            await asyncio.sleep(2)
+            new_url = self._page.url
+
+            if (new_url != classroom_url
+                    and course.slug in new_url
+                    and new_url not in seen_urls):
+                seen_urls.add(new_url)
+                module_links.append((new_url, card['text']))
+                print(f"    ✅ {card['text']!r}  →  {new_url}")
+
+            # Volver al classroom para el siguiente card
+            await self._goto(classroom_url)
+            await asyncio.sleep(3)
+
+        return module_links
 
     async def _get_lessons_from_module_page(
         self, module_url: str, module_name: str, course: Course
     ) -> List[Lesson]:
+        """
+        Dentro de un módulo, busca los videos/lecciones.
+        Estrategia 1: links <a> con URL que incluya el slug y vaya más profundo.
+        Estrategia 2: click-and-record en items clicables de la lista.
+        """
         await self._goto(module_url)
         await asyncio.sleep(3)
 
         slug = course.slug
+        module_path = module_url.replace("https://www.skool.com", "").rstrip("/")
+
+        # ── Estrategia 1: <a href> ────────────────────────────────────────
         page_links = await self._page.evaluate(f"""
             () => {{
                 const slug = {repr(slug)};
                 return Array.from(document.querySelectorAll('a[href]'))
                     .map(a => ({{
-                        href: a.getAttribute('href'),
-                        text: (a.innerText || '').trim().slice(0, 80)
+                        href: a.href || ('https://www.skool.com' + a.getAttribute('href')),
+                        rel:  a.getAttribute('href') || '',
+                        text: (a.innerText || '').trim().split('\\n')[0].slice(0, 80)
                     }}))
-                    .filter(x => x.href && x.href.includes(slug));
+                    .filter(x => x.href && x.href.includes(slug)
+                                       && x.href.includes('classroom'));
             }}
         """)
-        print(f"    [Debug] {len(page_links)} links con /{slug}/:")
+        print(f"    [Debug] Links con /{slug}/classroom:")
         for l in page_links[:15]:
-            print(f"      {l['href']}  →  {l['text']!r}")
+            print(f"      {l['rel']!r:55s} → {l['text']!r}")
 
-        module_path = module_url.replace("https://www.skool.com", "").rstrip("/")
         lessons = []
         seen_hrefs: set = set()
         position = 0
@@ -651,21 +792,88 @@ class SkoolClient:
             text = item.get('text', '').strip()
             if not href or not text or href in seen_hrefs:
                 continue
-            if href.rstrip("/") == module_path:
+            # Excluir el módulo mismo y el classroom raíz
+            href_path = href.replace("https://www.skool.com", "").rstrip("/")
+            if href_path == module_path:
                 continue
-            if slug not in href:
-                continue
-            if re.match(rf'^/{re.escape(slug)}/classroom/?$', href):
+            if re.match(rf'^/{re.escape(slug)}/classroom/?$', href_path):
                 continue
             seen_hrefs.add(href)
-            full_url = (f"https://www.skool.com{href}"
-                        if href.startswith("/") else href)
             lessons.append(Lesson(
-                title=text, url=full_url,
+                title=text, url=href,
                 module_name=module_name, course_name=course.name,
                 position=position,
             ))
             position += 1
+
+        if lessons:
+            return lessons
+
+        # ── Estrategia 2: click-and-record en items del módulo ────────────
+        print("    Sin <a> de lección. Usando click-and-record en items...")
+        return await self._click_record_lessons(
+            module_url, module_name, course
+        )
+
+    async def _click_record_lessons(
+        self, module_url: str, module_name: str, course: Course
+    ) -> List[Lesson]:
+        """Clic en cada item clicable del módulo para descubrir las lecciones."""
+        items = await self._page.evaluate("""
+            () => {
+                const results = [];
+                const seen = new Set();
+                // Buscar items de lista o elementos clicables con texto
+                const candidates = document.querySelectorAll(
+                    'li, [role="listitem"], [class*="lesson"], [class*="video"],'
+                    + '[class*="item"], [class*="row"]'
+                );
+                candidates.forEach(el => {
+                    const s = window.getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    if (s.cursor !== 'pointer' || r.width < 50 || r.height < 20) return;
+                    const text = (el.innerText || '').trim().split('\\n')[0].slice(0, 80);
+                    if (!text || seen.has(text)) return;
+                    seen.add(text);
+                    results.push({
+                        text,
+                        cx: Math.round(r.x + r.width / 2),
+                        cy: Math.round(r.y + r.height / 2),
+                    });
+                });
+                return results;
+            }
+        """)
+
+        lessons = []
+        seen_urls: set = set()
+        position = 0
+
+        for item in items:
+            url_before = self._page.url
+            await self._page.mouse.click(item['cx'], item['cy'])
+            try:
+                await self._page.wait_for_function(
+                    f"() => window.location.href !== {repr(url_before)}",
+                    timeout=5000,
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+            new_url = self._page.url
+            if (new_url != module_url
+                    and course.slug in new_url
+                    and new_url not in seen_urls):
+                seen_urls.add(new_url)
+                lessons.append(Lesson(
+                    title=item['text'], url=new_url,
+                    module_name=module_name, course_name=course.name,
+                    position=position,
+                ))
+                position += 1
+                print(f"      ✅ {item['text']!r}  →  {new_url}")
+            await self._goto(module_url)
+            await asyncio.sleep(2)
 
         return lessons
 
