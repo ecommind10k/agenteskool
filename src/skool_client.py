@@ -142,54 +142,57 @@ class SkoolClient:
 
     def _extract_slugs_from_json(self, data, _depth: int = 0) -> List[Tuple[str, str]]:
         """
-        Extracción muy permisiva: busca CUALQUIER string en un dict que
-        luzca como slug de comunidad, siempre que el dict tenga un campo
-        'name'/'title' (para no capturar IDs aleatorios).
+        Extrae (slug, nombre_real) de objetos JSON de Skool.
+        Skool usa: 'name' = slug, 'display_name' = nombre visible.
         """
         if _depth > 10:
             return []
         results = []
 
         if isinstance(data, dict):
-            name = str(
-                data.get("name") or data.get("title") or
-                data.get("communityName") or data.get("community_name") or
-                data.get("groupName") or ""
+            # Nombre visible (lo que el usuario ve)
+            display_name = str(
+                data.get("display_name") or data.get("displayName") or
+                data.get("title") or data.get("communityName") or
+                data.get("community_name") or data.get("groupName") or ""
             )
 
-            # Intentar campos explícitos primero
-            for key in ("slug", "communitySlug", "community_slug", "urlName",
-                        "url_name", "groupSlug", "group_slug", "domain",
-                        "handle", "communityDomain", "path", "shortName",
-                        "subdomain", "communityHandle"):
-                val = data.get(key)
-                if (isinstance(val, str)
-                        and re.match(r'^[a-z0-9][a-z0-9-]{2,}$', val)
-                        and val not in SYSTEM_SLUGS):
-                    results.append((val, name or val))
-                    return results  # dict encontrado, no seguir recursando
+            # Slug: campos explícitos primero
+            slug = str(
+                data.get("slug") or data.get("communitySlug") or
+                data.get("community_slug") or data.get("urlName") or
+                data.get("url_name") or data.get("groupSlug") or
+                data.get("domain") or data.get("handle") or
+                data.get("subdomain") or ""
+            )
 
-            # Buscar slug en cualquier campo URL
+            # En Skool, 'name' es el slug (e.g. "genesisdigital")
+            # y 'display_name' es el nombre real ("GENESIS DIGITAL")
+            name_val = str(data.get("name") or "")
+            if (not slug
+                    and name_val
+                    and re.match(r'^[a-z0-9][a-z0-9-]{2,}$', name_val)
+                    and name_val not in SYSTEM_SLUGS):
+                slug = name_val
+
+            # El nombre visible: usar display_name si hay slug; si no,
+            # puede ser que 'name' sea el nombre real (no un slug)
+            human_name = display_name or (
+                name_val if (not re.match(r'^[a-z0-9][a-z0-9-]{2,}$', name_val)
+                             or name_val == slug) else ""
+            ) or slug
+
+            if slug and slug not in SYSTEM_SLUGS:
+                results.append((slug, human_name or slug))
+                return results
+
+            # Buscar slug en campo URL
             for key in ("url", "communityUrl", "community_url", "link", "href"):
                 val = str(data.get(key) or "")
                 m = re.search(r'skool\.com/([a-z0-9][a-z0-9-]{2,})', val)
                 if m and m.group(1) not in SYSTEM_SLUGS:
-                    results.append((m.group(1), name or m.group(1)))
+                    results.append((m.group(1), display_name or m.group(1)))
                     return results
-
-            # Si el dict tiene 'name', buscar slugs en TODOS sus strings
-            if name:
-                for key, val in data.items():
-                    if (isinstance(val, str)
-                            and re.match(r'^[a-z0-9][a-z0-9-]{2,}$', val)
-                            and val not in SYSTEM_SLUGS
-                            and len(val) >= 3
-                            and key not in ("id", "userId", "ownerId",
-                                            "createdAt", "updatedAt", "color",
-                                            "icon", "image", "avatar", "photo",
-                                            "email", "token", "jwt", "hash")):
-                        results.append((val, name))
-                        return results
 
             # Recursar en claves conocidas
             for key in ("communities", "memberships", "member", "groups",
