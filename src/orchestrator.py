@@ -41,14 +41,14 @@ class Orchestrator:
             password=self.config.SKOOL_PASSWORD,
             headless=headless,
         ) as client:
-            courses = await client.scrape_all()
+            # El filtro se aplica dentro de scrape_all ANTES de visitar classrooms
+            courses = await client.scrape_all(
+                cursos_incluir=self.config.CURSOS_INCLUIR or None
+            )
 
         if not courses:
             print("[Orchestrator] No se encontraron cursos en tu cuenta de Skool.")
             return []
-
-        # Apply course filter from cursos.txt
-        courses = _filter_courses(courses, self.config.CURSOS_INCLUIR)
 
         for course in courses:
             course_dir = self.config.OUTPUT_DIR / _safe(course.name)

@@ -561,14 +561,47 @@ class SkoolClient:
 
     async def get_course_modules(self, course: Course) -> List[Module]:
         print(f"\n[Skool] Classroom: {course.name}")
+
+        # Interceptar TODAS las respuestas JSON mientras carga el classroom
+        captured: List[Tuple[str, object]] = []
+
+        async def _on_classroom_resp(response: Response):
+            try:
+                ct = response.headers.get("content-type", "")
+                if "json" not in ct:
+                    return
+                data = await response.json()
+                captured.append((response.url, data))
+                short = (response.url
+                         .replace("https://api2.skool.com", "[api2]")
+                         .replace("https://www.skool.com", ""))
+                print(f"  [Classroom API] {short[:80]}")
+            except Exception:
+                pass
+
+        self._page.on("response", _on_classroom_resp)
         await self._goto(course.url)
-        await asyncio.sleep(4)
+        await asyncio.sleep(5)
+        self._page.remove_listener("response", _on_classroom_resp)
         print(f"  URL actual: {self._page.url}")
+        print(f"  [API] {len(captured)} respuestas JSON capturadas al cargar classroom")
 
-        # Hacer scroll para cargar todas las tarjetas (lazy loading)
-        await self._scroll_page()
+        # ── Estrategia 1: extraer módulos de respuestas API ───────────────
+        module_links = self._modules_from_api_data(captured, course)
+        if module_links:
+            print(f"  ✅ {len(module_links)} módulo(s) encontrados via API")
 
-        module_links = await self._find_module_card_links(course)
+        # ── Estrategia 2: __NEXT_DATA__ embebido en la página ────────────
+        if not module_links:
+            module_links = await self._modules_from_next_data(course)
+            if module_links:
+                print(f"  ✅ {len(module_links)} módulo(s) encontrados via __NEXT_DATA__")
+
+        # ── Estrategia 3: DOM / click-and-record ─────────────────────────
+        if not module_links:
+            await self._scroll_page()
+            module_links = await self._find_module_card_links(course)
+
         print(f"  Módulos encontrados: {len(module_links)}")
         for mod_url, mod_name in module_links:
             print(f"    → {mod_name}  ({mod_url})")
@@ -592,6 +625,82 @@ class SkoolClient:
         total = sum(len(m.lessons) for m in modules)
         print(f"\n  ✅ Total: {total} lección(es) en {len(modules)} módulo(s)")
         return modules
+
+    def _modules_from_api_data(
+        self, captured: List[Tuple[str, object]], course: Course
+    ) -> List[Tuple[str, str]]:
+        """
+        Busca en las respuestas API capturadas cualquier lista de módulos/productos.
+        Devuelve [(url, nombre)] para cada módulo encontrado.
+        """
+        slug = course.slug
+        results: List[Tuple[str, str]] = []
+        seen: set = set()
+
+        def _search(data, depth: int = 0):
+            if depth > 8 or not data:
+                return
+            if isinstance(data, dict):
+                # Buscar arrays que parezcan listas de módulos/cursos
+                for key in ("products", "courses", "modules", "lessons",
+                            "curriculum", "items", "data", "results",
+                            "pageProps", "props"):
+                    if key in data and isinstance(data[key], list):
+                        _search(data[key], depth + 1)
+
+                # ¿Este objeto es un módulo? Buscar campos id/slug/name
+                item_id = (str(data.get("id") or data.get("_id") or "")).strip()
+                item_slug = (str(data.get("slug") or data.get("url_slug") or "")).strip()
+                item_name = (str(
+                    data.get("name") or data.get("title") or
+                    data.get("display_name") or ""
+                )).strip()
+
+                # Construir URL si tenemos suficiente info
+                if item_id or item_slug:
+                    part = item_slug or item_id
+                    url = f"https://www.skool.com/{slug}/classroom/{part}"
+                    if url not in seen and item_name and len(item_name) > 1:
+                        # Excluir items que parezcan la raíz del classroom
+                        if part != slug and "classroom" not in part:
+                            seen.add(url)
+                            results.append((url, item_name))
+
+                # Recursar en valores del dict
+                for v in data.values():
+                    if isinstance(v, (dict, list)):
+                        _search(v, depth + 1)
+
+            elif isinstance(data, list):
+                for item in data[:200]:
+                    _search(item, depth + 1)
+
+        for api_url, data in captured:
+            # Solo procesar respuestas que parezcan relevantes para el classroom
+            if (slug in api_url or "product" in api_url or "course" in api_url
+                    or "curriculum" in api_url or "classroom" in api_url
+                    or "_next/data" in api_url):
+                print(f"  [API parse] buscando módulos en: {api_url[:70]}")
+                _search(data)
+
+        return results
+
+    async def _modules_from_next_data(
+        self, course: Course
+    ) -> List[Tuple[str, str]]:
+        """Extrae módulos del objeto window.__NEXT_DATA__ inyectado por Next.js."""
+        try:
+            raw = await self._page.evaluate(
+                "() => window.__NEXT_DATA__ ? JSON.stringify(window.__NEXT_DATA__) : null"
+            )
+            if not raw:
+                return []
+            data = json.loads(raw)
+            print(f"  [__NEXT_DATA__] encontrado, buscando módulos...")
+            results = self._modules_from_api_data([(self._page.url, data)], course)
+            return results
+        except Exception:
+            return []
 
     async def _scroll_page(self):
         """Hace scroll hacia abajo para forzar la carga de contenido lazy."""
@@ -672,43 +781,66 @@ class SkoolClient:
         self, course: Course, classroom_url: str
     ) -> List[Tuple[str, str]]:
         """
-        Hace clic en cada tarjeta visible (div con cursor:pointer y un título)
-        y registra la URL a la que navega Skool. Así encontramos módulos
-        aunque sean divs de React sin href.
+        Hace clic en cada tarjeta visible y registra la URL a la que navega Skool.
+        Busca elementos clicables con múltiples estrategias (sin depender de cursor:pointer).
         """
-        # Buscar elementos clicables con un h1-h5 adentro
         cards = await self._page.evaluate("""
             () => {
                 const results = [];
                 const seen = new Set();
-                document.querySelectorAll('h1,h2,h3,h4,h5').forEach(h => {
-                    const text = h.innerText.trim().split('\\n')[0].slice(0, 80);
-                    if (!text || text.length < 2 || seen.has(text)) return;
-                    let el = h.parentElement;
-                    for (let d = 0; d < 7; d++) {
-                        if (!el || el === document.body) break;
-                        const s = window.getComputedStyle(el);
-                        const r = el.getBoundingClientRect();
-                        if (s.cursor === 'pointer' && r.width > 80 && r.height > 60) {
-                            seen.add(text);
-                            results.push({
-                                text,
-                                cx: Math.round(r.x + r.width / 2),
-                                cy: Math.round(r.y + r.height / 2),
-                                tag: el.tagName.toLowerCase(),
-                            });
-                            break;
-                        }
-                        el = el.parentElement;
-                    }
+                const NAV_TEXTS = new Set([
+                    'community','classroom','calendar','members','leaderboards',
+                    'about','map','settings','notifications','search','discover'
+                ]);
+
+                // Estrategia A: role="button" o tabindex con texto
+                const roleButtons = document.querySelectorAll('[role="button"],[tabindex]');
+                roleButtons.forEach(el => {
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 80 || r.height < 50 || r.y < 80) return;
+                    const text = (el.innerText || '').trim().split('\\n')[0].slice(0,80);
+                    if (!text || seen.has(text) || NAV_TEXTS.has(text.toLowerCase())) return;
+                    seen.add(text);
+                    results.push({text, cx: Math.round(r.x+r.width/2), cy: Math.round(r.y+r.height/2), tag: el.tagName.toLowerCase(), strategy: 'role'});
                 });
+
+                // Estrategia B: divs/articles grandes con heading adentro (tarjetas de módulo)
+                document.querySelectorAll('div,article,section,li').forEach(el => {
+                    const r = el.getBoundingClientRect();
+                    // Tarjetas de módulo suelen ser 150x120 o más grandes
+                    if (r.width < 120 || r.height < 100 || r.y < 80) return;
+                    const h = el.querySelector('h1,h2,h3,h4,h5,p[class*="title" i],span[class*="title" i]');
+                    if (!h) return;
+                    const text = h.innerText.trim().split('\\n')[0].slice(0,80);
+                    if (!text || text.length < 2 || seen.has(text)) return;
+                    if (NAV_TEXTS.has(text.toLowerCase())) return;
+                    // Verificar que el elemento no sea el body ni el nav
+                    if (el === document.body || el.tagName === 'BODY') return;
+                    const parent = el.closest('nav,header,footer');
+                    if (parent) return;
+                    seen.add(text);
+                    results.push({text, cx: Math.round(r.x+r.width/2), cy: Math.round(r.y+r.height/2), tag: el.tagName.toLowerCase(), strategy: 'card'});
+                });
+
+                // Estrategia C: cursor:pointer (original, como fallback)
+                document.querySelectorAll('*').forEach(el => {
+                    const s = window.getComputedStyle(el);
+                    if (s.cursor !== 'pointer') return;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 100 || r.height < 80 || r.y < 80) return;
+                    const text = (el.innerText || '').trim().split('\\n')[0].slice(0,80);
+                    if (!text || seen.has(text) || NAV_TEXTS.has(text.toLowerCase())) return;
+                    seen.add(text);
+                    results.push({text, cx: Math.round(r.x+r.width/2), cy: Math.round(r.y+r.height/2), tag: el.tagName.toLowerCase(), strategy: 'cursor'});
+                });
+
                 return results;
             }
         """)
 
-        print(f"  [Click-record] {len(cards)} tarjeta(s) con cursor:pointer:")
-        for c in cards[:10]:
-            print(f"    [{c['tag']}] {c['text']!r} @ ({c['cx']}, {c['cy']})")
+        print(f"  [Click-record] {len(cards)} tarjeta(s) encontradas:")
+        for c in cards[:15]:
+            print(f"    [{c['tag']}|{c['strategy']}] {c['text']!r} @ ({c['cx']}, {c['cy']})")
 
         if not cards:
             return []
@@ -959,10 +1091,31 @@ class SkoolClient:
     # Pipeline completo                                                    #
     # ------------------------------------------------------------------ #
 
-    async def scrape_all(self) -> List[Course]:
+    async def scrape_all(self, cursos_incluir: Optional[List[str]] = None) -> List[Course]:
         # El listener de API se activa dentro de login()
         await self.login()
         courses = await self.get_my_courses()
+
+        # Aplicar filtro ANTES de visitar classrooms (evita procesar cursos innecesarios)
+        if cursos_incluir:
+            filtered = []
+            for c in courses:
+                for name in cursos_incluir:
+                    if (name.lower() in c.name.lower()
+                            or name.lower() in c.slug.lower()):
+                        filtered.append(c)
+                        break
+            if filtered:
+                print(f"\n[Filtro] Procesando {len(filtered)} curso(s) de cursos.txt:")
+                for c in filtered:
+                    print(f"  ✓ {c.name}")
+                courses = filtered
+            else:
+                print("\n⚠️  Ningún curso coincide con cursos.txt. Procesando todos.")
+                print("   Cursos disponibles:")
+                for c in courses:
+                    print(f"     - {c.name}  (slug: {c.slug})")
+
         for course in courses:
             modules = await self.get_course_modules(course)
             course.modules = modules
