@@ -124,55 +124,88 @@ class SkoolClient:
                 return
             data = await response.json()
 
-            path = url.replace("https://www.skool.com", "")
-            # Imprimir TODOS los endpoints JSON para ayudar a depurar
-            print(f"  [API call] {path[:80]}")
+            path = (url.replace("https://api2.skool.com", "[api2]")
+                       .replace("https://www.skool.com", ""))
+            print(f"  [API] {path[:80]}")
+
+            # Imprimir respuesta completa del endpoint que devuelve grupos
+            if "groups" in url or "communit" in url or "member" in url:
+                print(f"  [RESPUESTA COMPLETA] {json.dumps(data)[:4000]}")
+
             found = self._extract_slugs_from_json(data)
             if found:
-                print(f"    → comunidades: {[s for s, _ in found]}")
+                slugs = list({s for s, _ in found} - SYSTEM_SLUGS)
+                print(f"    → slugs encontrados: {slugs}")
                 self._api_slugs.extend(found)
         except Exception:
             pass
 
     def _extract_slugs_from_json(self, data, _depth: int = 0) -> List[Tuple[str, str]]:
-        """Busca recursivamente {slug, name} de comunidad en un objeto JSON."""
-        if _depth > 8:
+        """
+        Extracción muy permisiva: busca CUALQUIER string en un dict que
+        luzca como slug de comunidad, siempre que el dict tenga un campo
+        'name'/'title' (para no capturar IDs aleatorios).
+        """
+        if _depth > 10:
             return []
         results = []
+
         if isinstance(data, dict):
-            # Nombres de campo que Skool podría usar para el slug
-            slug = str(
-                data.get("slug") or data.get("communitySlug") or
-                data.get("community_slug") or data.get("domain") or
-                data.get("handle") or data.get("communityDomain") or ""
-            )
             name = str(
                 data.get("name") or data.get("title") or
-                data.get("communityName") or data.get("community_name") or ""
+                data.get("communityName") or data.get("community_name") or
+                data.get("groupName") or ""
             )
-            # Extraer slug de un campo url si lo hay
-            if not slug:
-                url_field = str(data.get("url") or data.get("communityUrl") or "")
-                m = re.search(r'skool\.com/([a-z0-9][a-z0-9-]+)', url_field)
-                if m:
-                    slug = m.group(1)
 
-            if (slug
-                    and re.match(r'^[a-z0-9][a-z0-9-]{1,}$', slug)
-                    and slug not in SYSTEM_SLUGS):
-                results.append((slug, name or slug))
-                return results
+            # Intentar campos explícitos primero
+            for key in ("slug", "communitySlug", "community_slug", "urlName",
+                        "url_name", "groupSlug", "group_slug", "domain",
+                        "handle", "communityDomain", "path", "shortName",
+                        "subdomain", "communityHandle"):
+                val = data.get(key)
+                if (isinstance(val, str)
+                        and re.match(r'^[a-z0-9][a-z0-9-]{2,}$', val)
+                        and val not in SYSTEM_SLUGS):
+                    results.append((val, name or val))
+                    return results  # dict encontrado, no seguir recursando
+
+            # Buscar slug en cualquier campo URL
+            for key in ("url", "communityUrl", "community_url", "link", "href"):
+                val = str(data.get(key) or "")
+                m = re.search(r'skool\.com/([a-z0-9][a-z0-9-]{2,})', val)
+                if m and m.group(1) not in SYSTEM_SLUGS:
+                    results.append((m.group(1), name or m.group(1)))
+                    return results
+
+            # Si el dict tiene 'name', buscar slugs en TODOS sus strings
+            if name:
+                for key, val in data.items():
+                    if (isinstance(val, str)
+                            and re.match(r'^[a-z0-9][a-z0-9-]{2,}$', val)
+                            and val not in SYSTEM_SLUGS
+                            and len(val) >= 3
+                            and key not in ("id", "userId", "ownerId",
+                                            "createdAt", "updatedAt", "color",
+                                            "icon", "image", "avatar", "photo",
+                                            "email", "token", "jwt", "hash")):
+                        results.append((val, name))
+                        return results
+
+            # Recursar en claves conocidas
             for key in ("communities", "memberships", "member", "groups",
                         "spaces", "data", "pageProps", "props", "user",
                         "communityMember", "communityMembers", "items",
-                        "results", "records", "payload"):
+                        "results", "records", "payload", "list", "nodes",
+                        "edges", "content", "response"):
                 if key in data:
                     results.extend(
                         self._extract_slugs_from_json(data[key], _depth + 1)
                     )
+
         elif isinstance(data, list):
             for item in data[:500]:
                 results.extend(self._extract_slugs_from_json(item, _depth + 1))
+
         return results
 
     # ------------------------------------------------------------------ #
@@ -244,15 +277,25 @@ class SkoolClient:
                 print(f"    - {c.name}  ({c.slug})")
             return courses
 
-        # ------- Fallback: links en la página con patrón /slug -----------
-        print("  API no devolvió comunidades. Buscando links en la página...")
+        # ------- Fallback 1: switcher con MutationObserver ------------------
+        print("  API no devolvió comunidades. Intentando via switcher...")
         current_slug = self._slug_from_url(self._page.url)
+        switcher_courses = await self._discover_via_switcher(current_slug)
+        if len(switcher_courses) > 1:
+            return switcher_courses
+
+        # ------- Fallback 2: links en la página --------------------------
+        print("  Buscando links de comunidad en la página...")
         page_courses = await self._courses_from_page_links(current_slug)
         if page_courses:
-            print(f"  ✅ {len(page_courses)} comunidad(es) encontrada(s) via links:")
+            print(f"  ✅ {len(page_courses)} comunidad(es) via links:")
             for c in page_courses:
                 print(f"    - {c.name}  ({c.slug})")
             return page_courses
+
+        # Si el switcher encontró al menos la actual, usarla
+        if switcher_courses:
+            return switcher_courses
 
         # ------- Último recurso: solo la comunidad actual ----------------
         print("  ⚠️  Solo se encontró la comunidad actual.")
@@ -265,6 +308,166 @@ class SkoolClient:
                 slug=current_slug,
             )]
         return []
+
+    async def _discover_via_switcher(
+        self, current_slug: Optional[str]
+    ) -> List[Course]:
+        """
+        Abre el community switcher y captura las comunidades con
+        MutationObserver (detecta los nodos que React añade al DOM).
+        Usa el método de v3 (buscar button con texto+SVG) para abrir.
+        """
+        # Instalar MutationObserver ANTES de hacer clic
+        await self._page.evaluate("""
+            () => {
+                window.__skool_items = [];
+                window.__skool_obs = new MutationObserver(muts => {
+                    muts.forEach(m => {
+                        m.addedNodes.forEach(node => {
+                            if (node.nodeType !== 1) return;
+                            // Buscar en el nodo y sus descendientes
+                            const els = [node, ...node.querySelectorAll('*')];
+                            els.forEach(el => {
+                                const rect = el.getBoundingClientRect();
+                                if (rect.width < 20 || rect.height < 10) return;
+                                const t = (el.innerText || '').trim()
+                                           .split('\\n')[0].slice(0, 100);
+                                if (!t || t.length < 2) return;
+                                const already = window.__skool_items.some(
+                                    x => x.text === t
+                                );
+                                if (!already) {
+                                    window.__skool_items.push({
+                                        text: t,
+                                        cx: Math.round(rect.x + rect.width / 2),
+                                        cy: Math.round(rect.y + rect.height / 2),
+                                        tag: el.tagName.toLowerCase(),
+                                        x: Math.round(rect.x),
+                                        y: Math.round(rect.y),
+                                    });
+                                }
+                            });
+                        });
+                    });
+                });
+                window.__skool_obs.observe(document.body, {
+                    childList: true, subtree: true
+                });
+            }
+        """)
+
+        # Abrir el switcher (método probado en v3: busca button con texto+SVG)
+        opened = await self._open_switcher()
+        if not opened:
+            await self._page.evaluate(
+                "() => { if(window.__skool_obs) window.__skool_obs.disconnect(); }"
+            )
+            return []
+
+        await asyncio.sleep(3)   # esperar que React renderice el dropdown
+
+        # Leer lo que el observer capturó
+        raw_items = await self._page.evaluate("""
+            () => {
+                if (window.__skool_obs) window.__skool_obs.disconnect();
+                return window.__skool_items || [];
+            }
+        """)
+
+        print(f"  MutationObserver capturó {len(raw_items)} elemento(s):")
+        for it in raw_items[:30]:
+            print(f"    [{it['tag']:6s}] {it['text']!r:55s} @ ({it['x']}, {it['y']})")
+
+        # Cerrar el dropdown
+        await self._page.keyboard.press("Escape")
+        await asyncio.sleep(0.5)
+
+        if not raw_items:
+            print("  ⚠️  El observer no capturó elementos — el dropdown usa CSS show/hide")
+            return []
+
+        # Preparar lista de cursos
+        skip = {'create a community', 'discover communities',
+                '+ create', 'create', 'discover', 'search'}
+        courses: List[Course] = []
+        seen_slugs: set = set()
+
+        if current_slug:
+            seen_slugs.add(current_slug)
+            title = await self._page.title()
+            name = title.split(" - ")[0].split(" | ")[0].strip() or current_slug
+            courses.append(Course(
+                name=name,
+                url=f"https://www.skool.com/{current_slug}/classroom",
+                slug=current_slug,
+            ))
+
+        for item in raw_items:
+            text = item['text']
+            if text.lower() in skip:
+                continue
+
+            # Reabrir switcher y hacer clic en las coordenadas grabadas
+            await self._open_switcher()
+            await asyncio.sleep(2)
+
+            url_before = self._page.url
+            await self._page.mouse.click(item['cx'], item['cy'])
+
+            try:
+                await self._page.wait_for_function(
+                    f"() => window.location.href !== {repr(url_before)}",
+                    timeout=6000,
+                )
+            except Exception:
+                pass
+
+            await asyncio.sleep(2)
+            new_url = self._page.url
+            slug = self._slug_from_url(new_url)
+
+            if slug and slug not in seen_slugs and slug not in SYSTEM_SLUGS:
+                seen_slugs.add(slug)
+                title = await self._page.title()
+                real_name = title.split(" - ")[0].split(" | ")[0].strip() or text
+                courses.append(Course(
+                    name=real_name,
+                    url=f"https://www.skool.com/{slug}/classroom",
+                    slug=slug,
+                ))
+                print(f"  ✅ {real_name}  ({slug})")
+            else:
+                print(f"  ⚠️  {text!r}: slug={slug!r}")
+
+        await self._page.keyboard.press("Escape")
+
+        if len(courses) > 1:
+            print(f"\n  ✅ {len(courses)} comunidades via switcher")
+        return courses
+
+    async def _open_switcher(self) -> bool:
+        """
+        Método v3 probado: busca el primer button en la zona superior-izquierda
+        que tenga texto Y un elemento SVG (el ícono de dropdown).
+        """
+        buttons = await self._page.query_selector_all("button")
+        for btn in buttons:
+            try:
+                box = await btn.bounding_box()
+                if not box:
+                    continue
+                if box['y'] > 90 or box['x'] > 520 or box['width'] < 20:
+                    continue
+                text = (await btn.inner_text()).strip()
+                has_svg = await btn.query_selector("svg") is not None
+                if text and has_svg:
+                    await btn.click()   # clic nativo de Playwright sobre el elemento
+                    return True
+            except Exception:
+                continue
+        # Fallback: clic en la zona donde suele estar el switcher
+        await self._page.mouse.click(245, 50)
+        return True
 
     async def _courses_from_page_links(
         self, current_slug: Optional[str]
