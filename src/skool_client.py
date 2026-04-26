@@ -125,37 +125,53 @@ class SkoolClient:
             data = await response.json()
 
             path = url.replace("https://www.skool.com", "")
+            # Imprimir TODOS los endpoints JSON para ayudar a depurar
+            print(f"  [API call] {path[:80]}")
             found = self._extract_slugs_from_json(data)
             if found:
-                print(f"  [API] {path[:70]}  → {len(found)} comunidad(es)")
+                print(f"    → comunidades: {[s for s, _ in found]}")
                 self._api_slugs.extend(found)
         except Exception:
             pass
 
     def _extract_slugs_from_json(self, data, _depth: int = 0) -> List[Tuple[str, str]]:
         """Busca recursivamente {slug, name} de comunidad en un objeto JSON."""
-        if _depth > 6:
+        if _depth > 8:
             return []
         results = []
         if isinstance(data, dict):
-            slug = str(data.get("slug") or data.get("communitySlug") or
-                       data.get("community_slug") or "")
-            name = str(data.get("name") or data.get("title") or
-                       data.get("communityName") or "")
+            # Nombres de campo que Skool podría usar para el slug
+            slug = str(
+                data.get("slug") or data.get("communitySlug") or
+                data.get("community_slug") or data.get("domain") or
+                data.get("handle") or data.get("communityDomain") or ""
+            )
+            name = str(
+                data.get("name") or data.get("title") or
+                data.get("communityName") or data.get("community_name") or ""
+            )
+            # Extraer slug de un campo url si lo hay
+            if not slug:
+                url_field = str(data.get("url") or data.get("communityUrl") or "")
+                m = re.search(r'skool\.com/([a-z0-9][a-z0-9-]+)', url_field)
+                if m:
+                    slug = m.group(1)
+
             if (slug
                     and re.match(r'^[a-z0-9][a-z0-9-]{1,}$', slug)
                     and slug not in SYSTEM_SLUGS):
                 results.append((slug, name or slug))
-                return results  # no seguir recursando dentro de esta comunidad
+                return results
             for key in ("communities", "memberships", "member", "groups",
                         "spaces", "data", "pageProps", "props", "user",
-                        "communityMember", "communityMembers"):
+                        "communityMember", "communityMembers", "items",
+                        "results", "records", "payload"):
                 if key in data:
                     results.extend(
                         self._extract_slugs_from_json(data[key], _depth + 1)
                     )
         elif isinstance(data, list):
-            for item in data[:200]:
+            for item in data[:500]:
                 results.extend(self._extract_slugs_from_json(item, _depth + 1))
         return results
 
@@ -253,48 +269,76 @@ class SkoolClient:
     async def _courses_from_page_links(
         self, current_slug: Optional[str]
     ) -> List[Course]:
-        """Extrae comunidades de links <a href='/slug'> en la página."""
-        links = await self._page.evaluate(f"""
+        """
+        Extrae slugs de comunidad de CUALQUIER link en la página.
+        Usa patrón amplio /slug o /slug/cualquier-cosa para capturar
+        links de sidebar aunque apunten a /slug/feed, /slug/classroom, etc.
+        Navega a cada slug nuevo para verificar acceso y obtener el nombre real.
+        """
+        raw_slugs = await self._page.evaluate(f"""
             () => {{
-                const sysslugs = {list(SYSTEM_SLUGS)};
-                const results = [];
-                const seen = new Set();
-                document.querySelectorAll('a[href]').forEach(a => {{
-                    const href = (a.getAttribute('href') || '').split('?')[0].split('#')[0];
-                    // Aceptar /slug o /slug/  (sin subpáginas)
-                    const m = href.match(/^\\/([a-z0-9][a-z0-9-]+)\\/?$/);
-                    if (!m) return;
-                    const slug = m[1];
-                    if (sysslugs.includes(slug) || seen.has(slug)) return;
-                    seen.add(slug);
-                    const text = (a.getAttribute('title') || a.getAttribute('aria-label')
-                                  || a.innerText || '').trim().split('\\n')[0].slice(0, 80);
-                    results.push({{slug, text}});
+                const sysslugs = new Set({list(SYSTEM_SLUGS)});
+                const slugs = new Set();
+                // Buscar en <a href> y también en atributos data-href
+                document.querySelectorAll('[href], [data-href]').forEach(el => {{
+                    const href = (
+                        el.getAttribute('href') || el.getAttribute('data-href') || ''
+                    ).split('?')[0].split('#')[0];
+                    // /slug  o  /slug/cualquier-cosa
+                    const m = href.match(/^\\/([a-z0-9][a-z0-9-]{{2,}})(?:\\/|$)/);
+                    if (m && !sysslugs.has(m[1])) slugs.add(m[1]);
                 }});
-                return results;
+                return Array.from(slugs);
             }}
         """)
-        courses = []
+
+        print(f"  Slugs en la página: {raw_slugs}")
+
+        courses: List[Course] = []
         seen: set = set()
+
+        # Comunidad actual (ya estamos aquí, no necesitamos navegar)
         if current_slug:
             seen.add(current_slug)
-        for l in links:
-            if l["slug"] not in seen:
-                seen.add(l["slug"])
-                courses.append(Course(
-                    name=l["text"] or l["slug"],
-                    url=f"https://www.skool.com/{l['slug']}/classroom",
-                    slug=l["slug"],
-                ))
-        # Agregar comunidad actual al inicio si no está
-        if current_slug and current_slug not in {c.slug for c in courses}:
             title = await self._page.title()
-            name = title.split(" - ")[0].strip()
-            courses.insert(0, Course(
+            name = title.split(" - ")[0].split(" | ")[0].strip() or current_slug
+            courses.append(Course(
                 name=name,
                 url=f"https://www.skool.com/{current_slug}/classroom",
                 slug=current_slug,
             ))
+            print(f"  ✅ {name}  ({current_slug})")
+
+        # Para cada slug nuevo, navegar y verificar que es una comunidad accesible
+        for slug in raw_slugs:
+            if slug in seen:
+                continue
+            seen.add(slug)
+            try:
+                await self._goto(f"https://www.skool.com/{slug}/classroom")
+                await asyncio.sleep(2)
+                landed = self._page.url
+                landed_slug = self._slug_from_url(landed)
+                # Si no llegamos al slug esperado, no tenemos acceso
+                if landed_slug != slug:
+                    print(f"  ⚠️  {slug}: sin acceso (redirigió a {landed[:50]})")
+                    continue
+                title = await self._page.title()
+                name = title.split(" - ")[0].split(" | ")[0].strip() or slug
+                courses.append(Course(
+                    name=name,
+                    url=f"https://www.skool.com/{slug}/classroom",
+                    slug=slug,
+                ))
+                print(f"  ✅ {name}  ({slug})")
+            except Exception as e:
+                print(f"  ⚠️  Error verificando {slug}: {e}")
+
+        # Volver a la comunidad inicial para que el resto del flujo funcione
+        if current_slug and courses:
+            await self._goto(f"https://www.skool.com/{current_slug}/classroom")
+            await asyncio.sleep(2)
+
         return courses
 
     def _slug_from_url(self, url: str) -> Optional[str]:
