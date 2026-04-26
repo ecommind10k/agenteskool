@@ -612,13 +612,13 @@ class SkoolClient:
 
         modules: List[Module] = []
         for mod_index, (mod_url, mod_name) in enumerate(module_links):
-            print(f"\n  [Módulo {mod_index+1}] {mod_name}")
-            lessons = await self._get_lessons_from_module_page(
+            lessons, real_name = await self._get_lessons_from_module_page(
                 mod_url, mod_name, course
             )
+            print(f"\n  [Módulo {mod_index+1}] {real_name}")
             if lessons:
                 print(f"    {len(lessons)} lección(es)")
-                modules.append(Module(name=mod_name, lessons=lessons))
+                modules.append(Module(name=real_name, lessons=lessons))
             else:
                 print("    ⚠️  Sin lecciones")
 
@@ -626,11 +626,18 @@ class SkoolClient:
         print(f"\n  ✅ Total: {total} lección(es) en {len(modules)} módulo(s)")
         return modules
 
+    @staticmethod
+    def _is_module_id(s: str) -> bool:
+        """Los IDs de módulo de Skool son cadenas hexadecimales puras (sin guiones)."""
+        return bool(s and re.match(r'^[0-9a-f]{6,}$', s))
+
     def _modules_from_api_data(
         self, captured: List[Tuple[str, object]], course: Course
     ) -> List[Tuple[str, str]]:
         """
         Busca en las respuestas API capturadas cualquier lista de módulos/productos.
+        Los IDs reales de módulo en Skool son hex puras (ej: 5d76006e, c78a3971).
+        Slugs con guiones o letras no-hex son comunidades/usuarios, se ignoran.
         Devuelve [(url, nombre)] para cada módulo encontrado.
         """
         slug = course.slug
@@ -648,23 +655,30 @@ class SkoolClient:
                     if key in data and isinstance(data[key], list):
                         _search(data[key], depth + 1)
 
-                # ¿Este objeto es un módulo? Buscar campos id/slug/name
-                item_id = (str(data.get("id") or data.get("_id") or "")).strip()
+                # ¿Este objeto es un módulo?
+                item_id   = (str(data.get("id") or data.get("_id") or "")).strip()
                 item_slug = (str(data.get("slug") or data.get("url_slug") or "")).strip()
-                item_name = (str(
-                    data.get("name") or data.get("title") or
-                    data.get("display_name") or ""
-                )).strip()
 
-                # Construir URL si tenemos suficiente info
-                if item_id or item_slug:
-                    part = item_slug or item_id
+                # ── FILTRO CLAVE: solo aceptar IDs hex puros ──────────────
+                # Slugs de comunidades/usuarios tienen letras no-hex o guiones
+                # (ej: "genesisdigital", "klery-baron-4166") — se descartan
+                part = None
+                if self._is_module_id(item_slug):
+                    part = item_slug
+                elif self._is_module_id(item_id):
+                    part = item_id
+
+                if part:
+                    # Preferir título sobre nombre (name puede ser el hex ID)
+                    item_name = (str(
+                        data.get("title") or data.get("display_name") or
+                        data.get("name") or part
+                    )).strip()
+
                     url = f"https://www.skool.com/{slug}/classroom/{part}"
-                    if url not in seen and item_name and len(item_name) > 1:
-                        # Excluir items que parezcan la raíz del classroom
-                        if part != slug and "classroom" not in part:
-                            seen.add(url)
-                            results.append((url, item_name))
+                    if url not in seen and part != slug:
+                        seen.add(url)
+                        results.append((url, item_name))
 
                 # Recursar en valores del dict
                 for v in data.values():
@@ -885,9 +899,10 @@ class SkoolClient:
 
     async def _get_lessons_from_module_page(
         self, module_url: str, module_name: str, course: Course
-    ) -> List[Lesson]:
+    ) -> Tuple[List[Lesson], str]:
         """
         Dentro de un módulo, busca los videos/lecciones.
+        Retorna (lecciones, nombre_real_del_modulo).
         Estrategia 1: links <a> con URL que incluya el slug y vaya más profundo.
         Estrategia 2: click-and-record en items clicables de la lista.
         """
@@ -896,6 +911,36 @@ class SkoolClient:
 
         slug = course.slug
         module_path = module_url.replace("https://www.skool.com", "").rstrip("/")
+
+        # ── Leer nombre real del módulo desde la página ───────────────────
+        real_name = await self._page.evaluate("""
+            () => {
+                // Intentar h1, luego título de la página, luego sidebar activo
+                const h1 = document.querySelector('h1,h2,[class*="title" i]');
+                if (h1) {
+                    const t = h1.innerText.trim().split('\\n')[0].slice(0, 100);
+                    if (t && t.length > 2) return t;
+                }
+                const title = document.title.split(' - ')[0].split(' | ')[0].trim();
+                return title || null;
+            }
+        """) or module_name
+
+        # ── Expandir secciones colapsadas en el sidebar ───────────────────
+        # Skool usa aria-expanded y botones de toggle para sub-secciones
+        await self._page.evaluate("""
+            () => {
+                // Expandir elementos con aria-expanded="false"
+                document.querySelectorAll('[aria-expanded="false"]').forEach(el => {
+                    try { el.click(); } catch(e) {}
+                });
+                // Tambien intentar con details cerrados
+                document.querySelectorAll('details:not([open])').forEach(d => {
+                    try { d.open = true; } catch(e) {}
+                });
+            }
+        """)
+        await asyncio.sleep(1.5)
 
         # ── Estrategia 1: <a href> ────────────────────────────────────────
         page_links = await self._page.evaluate(f"""
@@ -912,7 +957,7 @@ class SkoolClient:
             }}
         """)
         print(f"    [Debug] Links con /{slug}/classroom:")
-        for l in page_links[:15]:
+        for l in page_links[:20]:
             print(f"      {l['rel']!r:55s} → {l['text']!r}")
 
         lessons = []
@@ -933,19 +978,18 @@ class SkoolClient:
             seen_hrefs.add(href)
             lessons.append(Lesson(
                 title=text, url=href,
-                module_name=module_name, course_name=course.name,
+                module_name=real_name, course_name=course.name,
                 position=position,
             ))
             position += 1
 
         if lessons:
-            return lessons
+            return lessons, real_name
 
         # ── Estrategia 2: click-and-record en items del módulo ────────────
         print("    Sin <a> de lección. Usando click-and-record en items...")
-        return await self._click_record_lessons(
-            module_url, module_name, course
-        )
+        click_lessons = await self._click_record_lessons(module_url, real_name, course)
+        return click_lessons, real_name
 
     async def _click_record_lessons(
         self, module_url: str, module_name: str, course: Course
