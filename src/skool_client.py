@@ -1,18 +1,24 @@
 """
-Skool browser automation client - v6
+Skool browser automation client - v7
 
-Community discovery:
-  1. Snapshot all text elements before clicking the switcher.
-  2. Click the switcher button (found by current community name text).
-  3. DOM-diff: any NEW text element that appeared is a dropdown item.
-  4. For each item click via Playwright get_by_text (fires React events).
+Estrategia para descubrir comunidades:
+  1. Interceptar respuestas JSON mientras se carga la página tras el login.
+     Skool hace fetch de los datos del usuario (comunidades, membresías) vía
+     API REST / Next.js data.  Capturamos esas respuestas y extraemos slugs.
+  2. Si la API no devuelve nada útil, buscar links <a href="/slug"> en la
+     página (iconos del sidebar, etc.).
+  3. Fallback: solo la comunidad actual.
+
+Para navegar entre comunidades NO usamos el dropdown — navegamos directamente
+a la URL de cada comunidad usando los slugs obtenidos en el paso anterior.
 """
 
 import asyncio
+import json
 import re
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple, Dict
-from playwright.async_api import async_playwright, BrowserContext
+from typing import Optional, List, Tuple
+from playwright.async_api import async_playwright, BrowserContext, Response
 
 SYSTEM_SLUGS = {
     'login', 'signup', 'profile', 'discover', 'notifications',
@@ -21,11 +27,6 @@ SYSTEM_SLUGS = {
     'feed', 'members', 'events', 'leaderboard', 'leaderboards',
     'courses', 'home', 'dashboard', 'admin', 'api', 'community',
     'groups', 'account', 'billing', 'contact', 'g', 'calendar',
-}
-
-SKIP_ITEM_TEXTS = {
-    'create a community', 'discover communities', 'search',
-    '+ create', 'create', 'discover', 'invite friends',
 }
 
 NAV_TIMEOUT = 60_000
@@ -66,6 +67,7 @@ class SkoolClient:
         self._browser = None
         self._context: Optional[BrowserContext] = None
         self._page = None
+        self._api_slugs: List[Tuple[str, str]] = []   # (slug, name)
 
     async def __aenter__(self):
         await self.start()
@@ -101,11 +103,71 @@ class SkoolClient:
         await self._page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
 
     # ------------------------------------------------------------------ #
+    # Interceptor de respuestas API                                        #
+    # ------------------------------------------------------------------ #
+
+    def _start_api_listener(self):
+        """Registra un listener que captura slugs de comunidad de las API calls."""
+        self._api_slugs = []
+        self._page.on("response", self._on_response)
+
+    def _stop_api_listener(self):
+        self._page.remove_listener("response", self._on_response)
+
+    async def _on_response(self, response: Response):
+        try:
+            url = response.url
+            if "skool.com" not in url:
+                return
+            ct = response.headers.get("content-type", "")
+            if "json" not in ct:
+                return
+            data = await response.json()
+
+            path = url.replace("https://www.skool.com", "")
+            found = self._extract_slugs_from_json(data)
+            if found:
+                print(f"  [API] {path[:70]}  → {len(found)} comunidad(es)")
+                self._api_slugs.extend(found)
+        except Exception:
+            pass
+
+    def _extract_slugs_from_json(self, data, _depth: int = 0) -> List[Tuple[str, str]]:
+        """Busca recursivamente {slug, name} de comunidad en un objeto JSON."""
+        if _depth > 6:
+            return []
+        results = []
+        if isinstance(data, dict):
+            slug = str(data.get("slug") or data.get("communitySlug") or
+                       data.get("community_slug") or "")
+            name = str(data.get("name") or data.get("title") or
+                       data.get("communityName") or "")
+            if (slug
+                    and re.match(r'^[a-z0-9][a-z0-9-]{1,}$', slug)
+                    and slug not in SYSTEM_SLUGS):
+                results.append((slug, name or slug))
+                return results  # no seguir recursando dentro de esta comunidad
+            for key in ("communities", "memberships", "member", "groups",
+                        "spaces", "data", "pageProps", "props", "user",
+                        "communityMember", "communityMembers"):
+                if key in data:
+                    results.extend(
+                        self._extract_slugs_from_json(data[key], _depth + 1)
+                    )
+        elif isinstance(data, list):
+            for item in data[:200]:
+                results.extend(self._extract_slugs_from_json(item, _depth + 1))
+        return results
+
+    # ------------------------------------------------------------------ #
     # Login                                                                #
     # ------------------------------------------------------------------ #
 
     async def login(self) -> bool:
         print("[Skool] Abriendo página de login...")
+        # Activar listener ANTES del login para capturar todas las API calls
+        self._start_api_listener()
+
         await self._goto("https://www.skool.com/login")
         await asyncio.sleep(1)
 
@@ -120,230 +182,120 @@ class SkoolClient:
                 lambda url: "skool.com" in url and "login" not in url,
                 timeout=20000,
             )
-            await asyncio.sleep(3)
-            print(f"[Skool] Login exitoso. URL: {self._page.url}")
-            return True
         except Exception:
             content = await self._page.content()
             if "incorrect" in content.lower() or "invalid" in content.lower():
                 raise ValueError("Credenciales incorrectas.")
-            return True
+
+        # Esperar a que carguen las API calls post-login
+        await asyncio.sleep(5)
+        print(f"[Skool] Login exitoso. URL: {self._page.url}")
+        return True
 
     # ------------------------------------------------------------------ #
-    # Community discovery                                                  #
+    # Descubrir comunidades                                                #
     # ------------------------------------------------------------------ #
 
     async def get_my_courses(self) -> List[Course]:
         print("[Skool] Descubriendo comunidades...")
 
-        start_url = self._page.url
-        start_slug = self._slug_from_url(start_url)
-        print(f"  URL: {start_url}  slug: {start_slug}")
+        # Si el listener ya estaba activo (llamado desde scrape_all),
+        # detenemos y usamos lo acumulado. Si se llama suelto, hacemos
+        # una recarga para capturar llamadas frescas.
+        if not self._api_slugs:
+            print("  Recargando página para capturar API calls...")
+            await self._goto(self._page.url)
+            await asyncio.sleep(5)
 
-        # Always include the community we landed on
+        self._stop_api_listener()
+
+        # Deduplicar slugs capturados por API
+        seen: set = set()
         courses: List[Course] = []
-        seen_slugs: set = set()
-        if start_slug:
-            seen_slugs.add(start_slug)
-            title = await self._page.title()
-            start_name = title.split(' - ')[0].strip()
-            courses.append(Course(
-                name=start_name,
-                url=f"https://www.skool.com/{start_slug}/classroom",
-                slug=start_slug,
-            ))
-            print(f"  ✅ (actual) {start_name}  →  {start_slug}")
 
-        # --- Step 1: snapshot what text is already on the page ----------
-        texts_before = set(await self._page.evaluate("""
-            () => {
-                const out = [];
-                document.querySelectorAll('*').forEach(el => {
-                    const t = (el.innerText || '').trim().split('\\n')[0].slice(0, 100);
-                    if (t && t.length > 1) out.push(t);
-                });
-                return out;
-            }
-        """))
-
-        # --- Step 2: click the community switcher ----------------------
-        switcher_pos = await self._find_switcher_position(start_slug)
-        print(f"  Switcher click → ({switcher_pos[0]:.0f}, {switcher_pos[1]:.0f})")
-        await self._page.mouse.click(switcher_pos[0], switcher_pos[1])
-        await asyncio.sleep(3)
-
-        # --- Step 3: DOM diff — find new elements ----------------------
-        new_items = await self._page.evaluate(f"""
-            () => {{
-                const before = new Set({list(texts_before)});
-                const results = [];
-                const seen = new Set();
-
-                document.querySelectorAll('*').forEach(el => {{
-                    const text = (el.innerText || '').trim().split('\\n')[0].slice(0, 100);
-                    if (!text || text.length < 2 || text.length > 100) return;
-                    if (before.has(text) || seen.has(text)) return;
-
-                    const rect = el.getBoundingClientRect();
-                    if (rect.width < 20 || rect.height < 10 || rect.height > 200) return;
-                    if (rect.x < 0 || rect.y < 0 || rect.x > 1280 || rect.y > 900) return;
-
-                    seen.add(text);
-                    results.push({{
-                        text,
-                        cx: Math.round(rect.x + rect.width / 2),
-                        cy: Math.round(rect.y + rect.height / 2),
-                        tag: el.tagName.toLowerCase(),
-                        x: Math.round(rect.x),
-                        y: Math.round(rect.y),
-                    }});
-                }});
-
-                results.sort((a, b) => a.y - b.y);
-                return results;
-            }}
-        """)
-
-        print(f"  {len(new_items)} elemento(s) nuevos tras abrir el switcher:")
-        for item in new_items[:30]:
-            print(f"    [{item['tag']:6s}] {item['text']!r:55s} @ ({item['x']}, {item['y']})")
-
-        if not new_items:
-            print("  ⚠️  No apareció ningún elemento nuevo — el dropdown no se abrió.")
-            print("       Intenta ejecutar con --visible para ver qué sucede.")
-            await self._page.keyboard.press("Escape")
-            return courses
-
-        # --- Step 4: click each new community item ---------------------
-        # Close dropdown first, then reopen for each click
-        await self._page.keyboard.press("Escape")
-        await asyncio.sleep(0.5)
-
-        for item in new_items:
-            text = item['text']
-            if text.lower() in SKIP_ITEM_TEXTS:
-                continue
-
-            # Re-open switcher
-            await self._page.mouse.click(switcher_pos[0], switcher_pos[1])
-            await asyncio.sleep(2)
-
-            url_before = self._page.url
-
-            # Click the item — try get_by_text first (fires React events)
-            clicked = await self._click_item_by_text(text, item['cx'], item['cy'])
-            if not clicked:
-                await self._page.keyboard.press("Escape")
-                continue
-
-            # Wait for navigation
-            try:
-                await self._page.wait_for_function(
-                    f"() => window.location.href !== {repr(url_before)}",
-                    timeout=6000,
-                )
-            except Exception:
-                pass
-
-            await asyncio.sleep(2)
-            new_url = self._page.url
-            slug = self._slug_from_url(new_url)
-
-            if slug and slug not in seen_slugs and slug not in SYSTEM_SLUGS:
-                seen_slugs.add(slug)
+        for slug, name in self._api_slugs:
+            if slug not in seen and slug not in SYSTEM_SLUGS:
+                seen.add(slug)
                 courses.append(Course(
-                    name=text,
+                    name=name,
                     url=f"https://www.skool.com/{slug}/classroom",
                     slug=slug,
                 ))
-                print(f"  ✅ {text}  →  {slug}")
-            else:
-                print(f"  ⚠️  {text!r}: slug={slug!r}  url={new_url[:60]}")
 
-        await self._page.keyboard.press("Escape")
-        await asyncio.sleep(0.3)
+        if courses:
+            print(f"  ✅ {len(courses)} comunidad(es) encontrada(s) via API:")
+            for c in courses:
+                print(f"    - {c.name}  ({c.slug})")
+            return courses
 
-        print(f"\n[Skool] Total: {len(courses)} comunidad(es) encontrada(s).")
-        return courses
+        # ------- Fallback: links en la página con patrón /slug -----------
+        print("  API no devolvió comunidades. Buscando links en la página...")
+        current_slug = self._slug_from_url(self._page.url)
+        page_courses = await self._courses_from_page_links(current_slug)
+        if page_courses:
+            print(f"  ✅ {len(page_courses)} comunidad(es) encontrada(s) via links:")
+            for c in page_courses:
+                print(f"    - {c.name}  ({c.slug})")
+            return page_courses
 
-    async def _find_switcher_position(
+        # ------- Último recurso: solo la comunidad actual ----------------
+        print("  ⚠️  Solo se encontró la comunidad actual.")
+        if current_slug:
+            title = await self._page.title()
+            name = title.split(" - ")[0].strip()
+            return [Course(
+                name=name,
+                url=f"https://www.skool.com/{current_slug}/classroom",
+                slug=current_slug,
+            )]
+        return []
+
+    async def _courses_from_page_links(
         self, current_slug: Optional[str]
-    ) -> Tuple[float, float]:
-        """
-        Find the community switcher button by locating the element that
-        contains the current community's slug text near the top of the page.
-        Returns (cx, cy) to click.
-        """
-        slug_key = (current_slug or "").lower().replace("-", "")
-
-        if len(slug_key) >= 4:
-            pos = await self._page.evaluate(f"""
-                () => {{
-                    const key = {repr(slug_key)};
-                    let best = null;
-                    let bestArea = Infinity;
-
-                    document.querySelectorAll('*').forEach(el => {{
-                        if (['SCRIPT','STYLE','HEAD','HTML','BODY'].includes(el.tagName)) return;
-                        const rect = el.getBoundingClientRect();
-                        // Must be in top 150 px and left 700 px
-                        if (rect.y > 150 || rect.x > 700) return;
-                        if (rect.width < 20 || rect.height < 12) return;
-
-                        const raw = (el.innerText || el.textContent || '')
-                            .toLowerCase().replace(/[^a-z0-9]/g, '');
-                        if (raw.includes(key)) {{
-                            const area = rect.width * rect.height;
-                            // prefer smallest matching element
-                            if (area < bestArea) {{
-                                bestArea = area;
-                                best = {{
-                                    x: rect.x + rect.width / 2,
-                                    y: rect.y + rect.height / 2,
-                                }};
-                            }}
-                        }}
-                    }});
-                    return best;
-                }}
-            """)
-            if pos:
-                return (pos['x'], pos['y'])
-
-        # Fallback: top-left area where Skool's switcher typically lives
-        return (100.0, 50.0)
-
-    async def _click_item_by_text(self, text: str, cx: float, cy: float) -> bool:
-        """Click a dropdown item. Tries get_by_text first (React-safe), then coords."""
-        # Playwright's get_by_text fires real pointer/mouse events
-        try:
-            loc = self._page.get_by_text(text, exact=True)
-            count = await loc.count()
-            for i in range(min(count, 5)):
-                el = loc.nth(i)
-                if await el.is_visible():
-                    await el.click()
-                    return True
-        except Exception:
-            pass
-
-        # Partial match fallback
-        try:
-            loc = self._page.get_by_text(text[:30])
-            count = await loc.count()
-            for i in range(min(count, 5)):
-                el = loc.nth(i)
-                if await el.is_visible():
-                    box = await el.bounding_box()
-                    if box and abs(box['x'] + box['width'] / 2 - cx) < 300:
-                        await el.click()
-                        return True
-        except Exception:
-            pass
-
-        # Last resort: coordinate click
-        await self._page.mouse.click(cx, cy)
-        return True
+    ) -> List[Course]:
+        """Extrae comunidades de links <a href='/slug'> en la página."""
+        links = await self._page.evaluate(f"""
+            () => {{
+                const sysslugs = {list(SYSTEM_SLUGS)};
+                const results = [];
+                const seen = new Set();
+                document.querySelectorAll('a[href]').forEach(a => {{
+                    const href = (a.getAttribute('href') || '').split('?')[0].split('#')[0];
+                    // Aceptar /slug o /slug/  (sin subpáginas)
+                    const m = href.match(/^\\/([a-z0-9][a-z0-9-]+)\\/?$/);
+                    if (!m) return;
+                    const slug = m[1];
+                    if (sysslugs.includes(slug) || seen.has(slug)) return;
+                    seen.add(slug);
+                    const text = (a.getAttribute('title') || a.getAttribute('aria-label')
+                                  || a.innerText || '').trim().split('\\n')[0].slice(0, 80);
+                    results.push({{slug, text}});
+                }});
+                return results;
+            }}
+        """)
+        courses = []
+        seen: set = set()
+        if current_slug:
+            seen.add(current_slug)
+        for l in links:
+            if l["slug"] not in seen:
+                seen.add(l["slug"])
+                courses.append(Course(
+                    name=l["text"] or l["slug"],
+                    url=f"https://www.skool.com/{l['slug']}/classroom",
+                    slug=l["slug"],
+                ))
+        # Agregar comunidad actual al inicio si no está
+        if current_slug and current_slug not in {c.slug for c in courses}:
+            title = await self._page.title()
+            name = title.split(" - ")[0].strip()
+            courses.insert(0, Course(
+                name=name,
+                url=f"https://www.skool.com/{current_slug}/classroom",
+                slug=current_slug,
+            ))
+        return courses
 
     def _slug_from_url(self, url: str) -> Optional[str]:
         m = re.match(r'https://www\.skool\.com/([a-z0-9][a-z0-9-]*)', url)
@@ -354,7 +306,7 @@ class SkoolClient:
         return None
 
     # ------------------------------------------------------------------ #
-    # Modules & lessons                                                    #
+    # Módulos y lecciones                                                  #
     # ------------------------------------------------------------------ #
 
     async def get_course_modules(self, course: Course) -> List[Module]:
@@ -369,18 +321,20 @@ class SkoolClient:
             print(f"    → {mod_name}  ({mod_url})")
 
         if not module_links:
-            print("  ⚠️  Sin módulos. Buscando lecciones directamente...")
+            print("  ⚠️  Sin tarjetas de módulo. Buscando lecciones directamente...")
             return await self._extract_lessons_as_single_module(course)
 
         modules: List[Module] = []
         for mod_index, (mod_url, mod_name) in enumerate(module_links):
             print(f"\n  [Módulo {mod_index+1}] {mod_name}")
-            lessons = await self._get_lessons_from_module_page(mod_url, mod_name, course)
+            lessons = await self._get_lessons_from_module_page(
+                mod_url, mod_name, course
+            )
             if lessons:
                 print(f"    {len(lessons)} lección(es)")
                 modules.append(Module(name=mod_name, lessons=lessons))
             else:
-                print(f"    ⚠️  Sin lecciones")
+                print("    ⚠️  Sin lecciones")
 
         total = sum(len(m.lessons) for m in modules)
         print(f"\n  ✅ Total: {total} lección(es) en {len(modules)} módulo(s)")
@@ -401,8 +355,8 @@ class SkoolClient:
                     if (pattern.test(href) && !seen.has(href)) {{
                         seen.add(href);
                         let text = '';
-                        const titleEl = a.querySelector('h1,h2,h3,h4,h5,p,span');
-                        if (titleEl) text = titleEl.innerText.trim().split('\\n')[0];
+                        const h = a.querySelector('h1,h2,h3,h4,h5,p,span');
+                        if (h) text = h.innerText.trim().split('\\n')[0];
                         if (!text) text = a.innerText.trim().split('\\n')[0];
                         if (text) results.push({{href, text}});
                     }}
@@ -453,9 +407,9 @@ class SkoolClient:
                 continue
             if re.match(rf'^/{re.escape(slug)}/classroom/?$', href):
                 continue
-
             seen_hrefs.add(href)
-            full_url = f"https://www.skool.com{href}" if href.startswith("/") else href
+            full_url = (f"https://www.skool.com{href}"
+                        if href.startswith("/") else href)
             lessons.append(Lesson(
                 title=text, url=full_url,
                 module_name=module_name, course_name=course.name,
@@ -469,7 +423,8 @@ class SkoolClient:
         slug = course.slug
         links = await self._page.evaluate(f"""
             () => Array.from(document.querySelectorAll('a[href]'))
-                .map(a => ({{href: a.getAttribute('href'), text: (a.innerText||'').trim()}}))
+                .map(a => ({{href: a.getAttribute('href'),
+                             text: (a.innerText||'').trim()}}))
                 .filter(x => x.href && x.href.includes('/{slug}/classroom/') && x.text)
         """)
         module = Module(name="Contenido del Curso")
@@ -488,7 +443,7 @@ class SkoolClient:
         return [module] if module.lessons else []
 
     # ------------------------------------------------------------------ #
-    # Lesson detail                                                        #
+    # Detalle de lección                                                   #
     # ------------------------------------------------------------------ #
 
     async def get_lesson_details(self, lesson: Lesson) -> Lesson:
@@ -543,10 +498,11 @@ class SkoolClient:
         return ""
 
     # ------------------------------------------------------------------ #
-    # Full pipeline                                                        #
+    # Pipeline completo                                                    #
     # ------------------------------------------------------------------ #
 
     async def scrape_all(self) -> List[Course]:
+        # El listener de API se activa dentro de login()
         await self.login()
         courses = await self.get_my_courses()
         for course in courses:
